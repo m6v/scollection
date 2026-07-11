@@ -16,6 +16,7 @@ usage() {
     echo " -m, --memory 'лимит'          Задать лимит оперативной памяти (например, -m 1G или -m 256M)"
     echo " --cpu 'доля'                  Задать лимит ядер CPU (например, --cpu 1 или --cpu 0.5)"
     echo " -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера"
+    echo "  -g, --gui                    Разрешить запуск графических приложений внутри контейнера"
     echo " -h, --help                    Показать эту справку и выйти"
     exit 1
 }
@@ -42,6 +43,7 @@ NET_NS_FILE="/var/run/netns/$NET_NAME"
 HOST_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
 CLEAN_UPPER=false
 IS_NET_ENABLED=false
+IS_GUI_ENABLED=false
 
 # Настройка сетевого пространства на хосте
 setup_network() {
@@ -180,6 +182,10 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             ;;
+        -g|--gui)
+            IS_GUI_ENABLED=true
+            shift 1
+            ;;
         -h|--help)
             usage
             ;;
@@ -298,6 +304,22 @@ if [ -n "$VOLUME_MAP" ]; then
     fi
 fi
 
+if [ "$IS_GUI_ENABLED" = true ]; then
+    echo "Подготовка инфраструктуры для вывода графики..."
+    # Готовим пути для X11 (X-сервера)
+    mkdir -p "$MERGED_DIR/tmp/.X11-unix"
+        
+    # Готовим пути для современного Wayland (если он используется на хосте)
+    if [ -n "$WAYLAND_DISPLAY" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+        mkdir -p "$MERGED_DIR$XDG_RUNTIME_DIR"
+    fi
+        
+    # АВТО-АВТОРИЗАЦИЯ X11: Чтобы X-сервер хоста разрешил контейнеру рисовать окна,
+    # мы временно открываем локальный доступ для локальных подключений.
+    # Это самый простой, нативный и надежный способ в Linux.
+    xhost +local: >/dev/null 2>&1 || true
+fi
+
 # Выполняем команду unshare, после чего запускаем команду, записанную в NET_PREFIX,
 # после выполнения команды из NET_PREFIX запускаем команду bash (паровозик команд)
 unshare --mount --pid --fork --propagation private $NET_PREFIX bash -c "
@@ -306,6 +328,17 @@ unshare --mount --pid --fork --propagation private $NET_PREFIX bash -c "
     cd /
     # Изоляция дисков внутри контейнера
     mount --make-rprivate /
+
+    # Нативно крепим графические кабели хоста прямо в новый корень контейнера
+    if [ '$IS_GUI_ENABLED' = true ]; then
+        # Монтируем сокет X11
+        mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
+        
+        # Монтируем сокет Wayland (если он есть)
+        if [ -n '$WAYLAND_DISPLAY' ]; then
+            mount --bind '/old_root$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY' '$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY'
+        fi
+    fi
 
     if [ -n '$VOLUME_MAP' ]; then
         mkdir -p '$GUEST_PATH'
@@ -332,8 +365,21 @@ unshare --mount --pid --fork --propagation private $NET_PREFIX bash -c "
         export LC_CTYPE=C.UTF-8
         export LC_ALL=C.UTF-8
         export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-        # Запуск финальной команды в чистом окружении
-        exec $COMMAND
+
+        if [ '$IS_GUI_ENABLED' = true ]; then
+            export DISPLAY='$DISPLAY'
+            export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'
+            # Создаем чременную папку рантайма прямо в изолированном /run контейнера.
+            mkdir -p /run/user/0
+            export XDG_RUNTIME_DIR=/run/user/0
+            export NO_AT_BRIDGE=1
+            
+            # Если GUI включен, запускаем $COMMAND через D-Bus
+            exec dbus-run-session -- '$COMMAND'
+        else
+            # Если GUI отключен, запускаем чистую консольную команду
+            exec '$COMMAND'
+        fi
     '
 "
 
