@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+'''
+Программа отправки широковещательных уведомлений,
+которая является точкой назначения syslog-ng и
+в бесконечном цикле ожидает на стандартном вводе
+сообщения в виде разделенымх символом ; полей
+Первое поле - приоритет, второе - заголовок,
+последующие - тело сообщения
+
+NB! Для включения широковещательных уведомлений необходимо создать
+конфигурационные файлы ~/.config/fly-notificationsrc и /etc/xdg/fly-notificationsrc,
+(второй файл опционально, скорее всего включает широковешательные сообщения сразу для всех пользователей) содержащие строки
+[Notifications]
+ListenForBroadcasts=true
+'''
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+import logging
+import os
+import signal
+import sys
+
+
+class CustomDbusService(dbus.service.Object):
+    def __init__(self, bus, path):
+        dbus.service.Object.__init__(self, bus, path)
+
+    @dbus.service.signal(dbus_interface="org.kde.BroadcastNotifications", signature="a{sv}")
+    # Имя метода должно соответствовать имени отправляемого сигнала,
+    # msg - словарь a{sv} со строковыми ключами (string) и произвольными значениями (variant)
+    # тело метода отсутствует, можно вставить логирование
+    def Notify(self, msg):
+        pass
+
+    def send(self, line):
+        priority, title = line.split(";")[:2]
+        body = "\n".join(line.split(";")[2:])
+
+        if priority == "critical":
+            icon_name = "dialog-error"
+        elif priority == "normal":
+            icon_name = "dialog-warning"
+        else:
+            icon_name = "dialog-information"
+
+        msg = {"appName": "Системные события",
+               "appIcon": icon_name,
+               "body": body,
+               "summary": title,
+               "timeout": 5000,
+               # "hints": "Text of hints",
+               # "uids": ['0', '1000']
+              }
+        self.Notify(msg)
+
+def main():
+    appname = os.path.basename(sys.argv[0]).split('.')[0]
+    logging.basicConfig(filename='/var/log/%s.log' % appname,
+                        format='%(asctime)s %(pathname)s: %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S',
+                        level=logging.DEBUG)
+    logging.debug('%s is running...' % os.path.basename(sys.argv[0]))
+
+    def handler(signum, frame):
+        signame = signal.Signals(signum).name
+        logging.debug('%s is stopped...' % os.path.basename(sys.argv[0]))
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, handler)
+
+    dbus_loop = DBusGMainLoop()
+    bus = dbus.SystemBus(mainloop=dbus_loop)
+    # можно по-другому, как лучше или правильнее?
+    # DBusGMainLoop(set_as_default=True)
+    # bus = dbus.SystemBus()
+    path = "/"
+    service = CustomDbusService(bus, path)
+
+    while True:
+        try:
+            for line in sys.stdin:
+                logging.debug('Get line from stdin: %s' % line.strip())
+                service.send(line)
+        except Exception as e:
+            logging.error(e)
+
+if __name__ == "__main__":
+    main()
