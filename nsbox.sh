@@ -30,15 +30,78 @@ MERGED_DIR="$BASE_DIR/merged"
 
 VOLUME_MAP=""
 
-VETH_HOST="veth-host"
+BRIDGE_NAME="br-nsbox"
+VETH_HOST="veth-$$"  # Динамическое имя адаптера хоста
 VETH_GUEST="veth-guest"
 NET_NAME="container_net"
 NET_NS_FILE="/var/run/netns/$NET_NAME"
 
-# Определение сетевой карта хоста с доступом в интернет
+# Определение сетевой карты хоста с доступом в интернет
 HOST_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
 CLEAN_UPPER=false
-IS_NET_ENABLED=false # Сеть отключена по умолчанию для максимальной безопасности
+IS_NET_ENABLED=false
+
+# Настройка сетевого пространства на хосте
+setup_network() {
+    if [ "$IS_NET_ENABLED" != true ]; then
+        echo "" > "$MERGED_DIR/etc/resolv.conf"
+        return 0
+    fi
+
+    if [ "$SET_IP" = "10.0.0.1" ]; then
+        echo "Ошибка: Адрес $SET_IP занят виртуальным мостом хоста (шлюзом)."
+        exit 1
+    fi
+
+    echo "Настройка сети через виртуальный мост $BRIDGE_NAME..."
+
+    if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME"; fi
+
+    if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
+        ip link add "$BRIDGE_NAME" type bridge
+        ip addr add 10.0.0.1/24 dev "$BRIDGE_NAME"
+        ip link set "$BRIDGE_NAME" up
+
+        sysctl -w net.ipv4.ip_forward=1 > /dev/null
+        nft add table ip nsbox_nat 2>/dev/null || true
+        nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+        nft add rule ip nsbox_nat postrouting oifname "$HOST_IFACE" ip saddr 10.0.0.0/24 masquerade 2>/dev/null || true
+    fi
+
+    if [ "$SET_IP" = "auto" ]; then
+        # Если включен авторежим, циклом от .2 до .254 и ищем первый свободный IP
+        for i in {2..254}; do
+            # Проверяем, не выдан ли уже этот IP какому-то активному сетевому пространству имен
+            if ! ip netns exec "$NET_NAME" ip addr show 2>/dev/null | grep -q "10.0.0.$i/"; then
+                # Проверяем, нет ли его в ARP-таблице соседей нашего моста
+                if ! ip neighbor show dev "$BRIDGE_NAME" | grep -q "10.0.0.$i "; then
+                    SET_IP="10.0.0.$i"
+                    break
+                fi
+            fi
+        done
+        # Если цикл завершился, а переменная осталась пустой — сеть переполненна
+        if [ -z "$SET_IP" ]; then
+            echo "Ошибка: Не удалось автоматически выделить IP-адрес. В подсети 10.0.0.0/24 не осталось свободных адресов!"
+            exit 1
+        fi
+    fi
+
+    echo "Контейнеру выделен IP-адрес $SET_IP"
+
+    ip netns add "$NET_NAME"
+    ip link add "$VETH_HOST" type veth peer name "$VETH_GUEST" netns "$NET_NAME"
+
+    ip link set "$VETH_HOST" master "$BRIDGE_NAME"
+    ip link set "$VETH_HOST" up
+
+    # Нативно присваиваем вычисленный или указанный адрес
+    ip netns exec "$NET_NAME" ip link set "$VETH_GUEST" up
+    ip netns exec "$NET_NAME" ip addr add "$SET_IP/24" dev "$VETH_GUEST"
+    ip netns exec "$NET_NAME" ip route add default via 10.0.0.1
+
+    echo "nameserver 8.8.8.8" > "$MERGED_DIR/etc/resolv.conf"
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -58,7 +121,22 @@ while [ $# -gt 0 ]; do
             ;;
         -n|--net)
             IS_NET_ENABLED=true
-            shift 1
+            # Если следующего аргумента нет или это другой флаг (начинается с '-')
+            if [[ -z "$2" ]] || [[ "$2" =~ ^- ]]; then
+                SET_IP="auto" # Включаем чистый автопилот
+                shift 1       # Сдвигаем только сам флаг --net
+                
+            # Если следующий аргумент — это валидный IP-адрес
+            elif [[ "$2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                SET_IP="$2"   # Жестко фиксируем статический адрес
+                shift 2       # Сдвигаем и флаг, и сам IP-адрес
+                
+            # Аргумент передан, но это не флаг и не валидный IP (опечатка!)
+            else
+                echo "Ошибка: Неверный формат IP-адреса для флага --net: '$2'"
+                echo "Используйте валидный IP (например, --net 10.0.0.5) или оставьте флаг пустым для автовыбора."
+                exit 1
+            fi
             ;;
         -v|--volume)
             if [ -n "$2" ]; then
@@ -137,48 +215,14 @@ set meta-flag on
 set byte-oriented off
 EOF
 
-# Настройка сетевого пространства на хосте
-if [ "$IS_NET_ENABLED" = true ]; then
-    echo "Настройка сетевой подсистемы..."
-
-    # Очистка старых интерфейсов хоста перед стартом
-    if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME"; fi
-    ip link delete "$VETH_HOST" 2>/dev/null || true
-    nft delete table ip container_nat 2>/dev/null || true
-
-    # Включение NAT на хосте через nftables
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null
-    nft add table ip container_nat
-    nft add chain ip container_nat postrouting { type nat hook postrouting priority 100 \; }
-    nft add rule ip container_nat postrouting oifname "$HOST_IFACE" ip saddr 10.0.0.0/24 masquerade
-
-    # Создание сетевого пространства имен
-    ip netns add "$NET_NAME"
-    # Прокладка виртуального сетевого кабеля, конец veth-host закрепляется на хосте,
-    # конец veth-guest принудительно заталкивается в созданную сеть
-    ip link add "$VETH_HOST" type veth peer name "$VETH_GUEST" netns "$NET_NAME"
-
-    # Поднимаем адаптер VETH_HOST на стороне хоста
-    ip link set "$VETH_HOST" up
-    ip addr add 10.0.0.1/24 dev "$VETH_HOST"
-
-    # Настройка гостевого конца кабеля внутри созданной сети
-    ip netns exec "$NET_NAME" ip link set "$VETH_GUEST" up
-    ip netns exec "$NET_NAME" ip addr add 10.0.0.2/24 dev "$VETH_GUEST"
-    ip netns exec "$NET_NAME" ip route add default via 10.0.0.1
-
-    # Прописываем DNS
-    echo "nameserver 8.8.8.8" > "$MERGED_DIR/etc/resolv.conf"
-else
-    # Запуск контейнера в глухой изоляции
-    echo "" > "$MERGED_DIR/etc/resolv.conf"
-fi
-
 echo "Включение контроля ресурсов cgroups v2 (512M)..."
 CGROUP_PATH="/sys/fs/cgroup/box_container"
 mkdir -p "$CGROUP_PATH"
 echo "512M" > "$CGROUP_PATH/memory.max"
 echo $$ > "$CGROUP_PATH/cgroup.procs"
+
+# Настройка сетевого пространства на хосте
+setup_network
 
 # Подготовка путей для проброса каталога в контейнер
 if [ -n "$VOLUME_MAP" ]; then
@@ -251,8 +295,8 @@ if mountpoint -q "$BASE_DIR"; then umount -l "$BASE_DIR" ; fi
 if [ "$IS_NET_ENABLED" = true ]; then
     echo "Очистка сетевых ресурсов хоста..."
     if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME"; fi
+    # Удаляем хостовый конец нашего динамического провода veth-$$
     ip link delete "$VETH_HOST" 2>/dev/null || true
-    nft delete table ip container_nat 2>/dev/null || true
 fi
 
 # # Удаление созданной группы cgroups v2
