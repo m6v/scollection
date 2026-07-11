@@ -45,6 +45,8 @@ CLEAN_UPPER=false
 IS_NET_ENABLED=false
 IS_GUI_ENABLED=false
 
+CGROUP_PATH="/sys/fs/cgroup/nsbox"
+
 # Настройка сетевого пространства на хосте
 setup_network() {
     if [ "$IS_NET_ENABLED" != true ]; then
@@ -105,6 +107,75 @@ setup_network() {
     ip netns exec "$NET_NAME" ip route add default via 10.0.0.1
 
     cp -L /etc/resolv.conf "$MERGED_DIR/etc/resolv.conf" 2>/dev/null || true
+}
+
+# Настройка графического окружения
+setup_gui() {
+    if [ "$IS_GUI_ENABLED" = true ]; then
+        echo "Подготовка безопасной инфраструктуры X11..."
+        mkdir -p "$MERGED_DIR/tmp/.X11-unix"
+
+        # Если на хосте используется Wayland
+        if [ -n "$WAYLAND_DISPLAY" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+            mkdir -p "$MERGED_DIR$XDG_RUNTIME_DIR"
+        fi
+            
+        # Напрямую получаем путь к активному ключу X11 из параметров запущенного графического сервера хоста
+        REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' | head -n 1 | cut -d' ' -f2)
+            
+        # Если секретный файл успешно обнаружен — копируем его в контейнер
+        if [ -n "$REAL_XAUTH" ] && [ -f "$REAL_XAUTH" ]; then
+            mkdir -p "$MERGED_DIR/root"
+            cp -L "$REAL_XAUTH" "$MERGED_DIR/root/.Xauthority" 2>/dev/null || true
+            echo "Ключ авторизации X11 $REAL_XAUTH успешно импортирован."
+        else
+            echo "Предупреждение: Активный файл авторизации X11 не обнаружен."
+        fi
+            
+        # Закрываем шлюз хоста
+        xhost -local: >/dev/null 2>&1 || true
+    fi
+}
+
+# Настройка контрольных групп
+setup_cgroups() {
+    # Если задан хотя бы один из лимитов (память или процессор)
+    if [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
+        echo "Настройка контроля ресурсов cgroups v2..."
+        mkdir -p "$CGROUP_PATH"
+        echo $$ > "$CGROUP_PATH/cgroup.procs"
+
+        # Применяем лимит оперативной памяти, если он указан
+        if [ -n "$MEM_LIMIT" ]; then
+            echo "Лимит оперативной памяти зафиксирован: $MEM_LIMIT"
+            echo "$MEM_LIMIT" > "$CGROUP_PATH/memory.max"
+        fi
+
+        # Применяем лимит процессора, если он указан
+        if [ -n "$CPU_LIMIT" ]; then
+            echo "Лимит ядер CPU зафиксирован: $CPU_LIMIT"
+            
+            # Нативная конвертация долей ядер в микросекунды для cgroups v2.
+            # Чтобы Bash мог умножать дроби без утилиты bc, мы делим логику:
+            # Умножаем значение на 100000, используя встроенный механизм Bash printf/awk
+            CPU_QUOTA=$(awk "BEGIN {print int($CPU_LIMIT * 100000)}")
+            
+            echo "$CPU_QUOTA 100000" > "$CGROUP_PATH/cpu.max"
+        fi
+    fi
+}
+
+sanitize_accounts() {
+    echo "Очистка базы пользователей контейнера..."
+    
+    # Создаем папку etc в верхнем слое изменений (upper), если её ещё нет
+    mkdir -p "$UPPER_DIR/etc"
+    # Фильтрация пользователей
+    awk -F: '$3 < 1000 || $3 == 65534' /etc/passwd > "$UPPER_DIR/etc/passwd"
+    # ПФильтрация групп
+    awk -F: '$3 < 1000 || $3 == 65534' /etc/group > "$UPPER_DIR/etc/group"
+    # Задаем безопасные права доступа
+    chmod 644 "$UPPER_DIR/etc/passwd" "$UPPER_DIR/etc/group"
 }
 
 while [ $# -gt 0 ]; do
@@ -254,36 +325,14 @@ set meta-flag on
 set byte-oriented off
 EOF
 
-
-CGROUP_PATH="/sys/fs/cgroup/box_container"
-
-# Если задан хотя бы один из лимитов (память или процессор)
-if [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
-    echo "Настройка контроля ресурсов cgroups v2..."
-    mkdir -p "$CGROUP_PATH"
-    echo $$ > "$CGROUP_PATH/cgroup.procs"
-
-    # Применяем лимит оперативной памяти, если он указан
-    if [ -n "$MEM_LIMIT" ]; then
-        echo "Лимит оперативной памяти зафиксирован: $MEM_LIMIT"
-        echo "$MEM_LIMIT" > "$CGROUP_PATH/memory.max"
-    fi
-
-    # Применяем лимит процессора, если он указан
-    if [ -n "$CPU_LIMIT" ]; then
-        echo "Лимит ядер CPU зафиксирован: $CPU_LIMIT"
-        
-        # Нативная конвертация долей ядер в микросекунды для cgroups v2.
-        # Чтобы Bash мог умножать дроби без утилиты bc, мы делим логику:
-        # Умножаем значение на 100000, используя встроенный механизм Bash printf/awk
-        CPU_QUOTA=$(awk "BEGIN {print int($CPU_LIMIT * 100000)}")
-        
-        echo "$CPU_QUOTA 100000" > "$CGROUP_PATH/cpu.max"
-    fi
-fi
-
+# Настройка пользователей и групп
+sanitize_accounts
+# Настройка контрольных групп
+setup_cgroups
 # Настройка сетевого пространства на хосте
 setup_network
+# Настройка графического окружения
+setup_gui
 
 # Подготовка путей для проброса каталога в контейнер
 if [ -n "$VOLUME_MAP" ]; then
@@ -302,22 +351,6 @@ if [ -n "$VOLUME_MAP" ]; then
         echo "Ошибка: Каталог на хосте '$HOST_PATH' не существует."
         exit 1
     fi
-fi
-
-if [ "$IS_GUI_ENABLED" = true ]; then
-    echo "Подготовка инфраструктуры для вывода графики..."
-    # Готовим пути для X11 (X-сервера)
-    mkdir -p "$MERGED_DIR/tmp/.X11-unix"
-        
-    # Готовим пути для современного Wayland (если он используется на хосте)
-    if [ -n "$WAYLAND_DISPLAY" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
-        mkdir -p "$MERGED_DIR$XDG_RUNTIME_DIR"
-    fi
-        
-    # АВТО-АВТОРИЗАЦИЯ X11: Чтобы X-сервер хоста разрешил контейнеру рисовать окна,
-    # мы временно открываем локальный доступ для локальных подключений.
-    # Это самый простой, нативный и надежный способ в Linux.
-    xhost +local: >/dev/null 2>&1 || true
 fi
 
 # Выполняем команду unshare, после чего запускаем команду, записанную в NET_PREFIX,
@@ -373,11 +406,10 @@ unshare --mount --pid --fork --propagation private $NET_PREFIX bash -c "
             mkdir -p /run/user/0
             export XDG_RUNTIME_DIR=/run/user/0
             export NO_AT_BRIDGE=1
-            
-            # Если GUI включен, запускаем $COMMAND через D-Bus
+            export XAUTHORITY=/root/.Xauthority
+            # Запуск сессионной шины, которая в свою очередь запустит $COMMAND
             exec dbus-run-session -- '$COMMAND'
         else
-            # Если GUI отключен, запускаем чистую консольную команду
             exec '$COMMAND'
         fi
     '
