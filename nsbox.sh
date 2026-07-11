@@ -13,8 +13,9 @@ usage() {
     echo " -c, --command 'команда'       Выполнить команду в изолированном контейнере"
     echo " --clean                       Сбросить все прошлые изменения в контейнере"
     echo " -n, --net                     Включить изолированную сеть с доступом в интернет"
-    echo " -m, --memory 'лимит'          Задать лимит оперативной памяти (например, -m 1G или -m 256M)"
-    echo " --cpu 'доля'                  Задать лимит ядер CPU (например, --cpu 1 или --cpu 0.5)"
+    echo " -p, --port 'хост:гость'       Пробросить порт наружу, например, -p 8080:80"
+    echo " -m, --memory 'лимит'          Задать лимит оперативной памяти, например, -m 1G или -m 256M"
+    echo " --cpu 'доля'                  Задать лимит ядер CPU, например, --cpu 1 или --cpu 0.5"
     echo " -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера"
     echo "  -g, --gui                    Разрешить запуск графических приложений внутри контейнера"
     echo " -h, --help                    Показать эту справку и выйти"
@@ -107,6 +108,30 @@ setup_network() {
     ip netns exec "$NET_NAME" ip route add default via 10.0.0.1
 
     cp -L /etc/resolv.conf "$MERGED_DIR/etc/resolv.conf" 2>/dev/null || true
+
+    if [ -n "$PORT_MAP" ]; then
+        # Разрезаем порты по двоеточию
+        HOST_PORT=$(echo "$PORT_MAP" | cut -d':' -f1)
+        GUEST_PORT=$(echo "$PORT_MAP" | cut -d':' -f2)
+
+        echo "Активирован проброс порта: хост $HOST_PORT -> контейнер $SET_IP:$GUEST_PORT"
+
+        # Принудительно разрешаем ядру хоста перенаправлять локальный трафик (127.0.0.1) в сеть нашего моста!
+        sysctl -w net.ipv4.conf.all.route_localnet=1 > /dev/null
+        sysctl -w net.ipv4.conf."$BRIDGE_NAME".route_localnet=1 > /dev/null
+
+        # DNAT для внешнего трафика (Prerouting)
+        nft add chain ip nsbox_nat prerouting { type nat hook prerouting priority -100 \; } 2>/dev/null || true
+        nft add rule ip nsbox_nat prerouting tcp dport "$HOST_PORT" dnat to "$SET_IP:$GUEST_PORT" 2>/dev/null || true
+        
+        # DNAT для локального трафика хоста (Output)
+        nft add chain ip nsbox_nat output { type nat hook output priority -100 \; } 2>/dev/null || true
+        nft add rule ip nsbox_nat output tcp dport "$HOST_PORT" dnat to "$SET_IP:$GUEST_PORT" 2>/dev/null || true
+
+        # Синхоронизатор обратного пути (Postrouting SNAT), маскируем пакеты, идущие от хоста к контейнеру
+        # через мост br-nsbox, и заставляет контейнер слать ответ на 10.0.0.1
+        nft add rule ip nsbox_nat postrouting ip daddr "$SET_IP" tcp dport "$GUEST_PORT" masquerade 2>/dev/null || true
+    fi
 }
 
 # Настройка графического окружения
@@ -210,6 +235,21 @@ while [ $# -gt 0 ]; do
             else
                 echo "Ошибка: Неверный формат IP-адреса для флага --net: '$2'"
                 echo "Используйте валидный IP (например, --net 10.0.0.5) или оставьте флаг пустым для автовыбора."
+                exit 1
+            fi
+            ;;
+        -p|--port)
+            if [ -n "$2" ]; then
+                # Проверяем наличие двоеточия, если его нет — падаем!
+                if ! echo "$2" | grep -q ":"; then
+                    echo "Ошибка: Неверный формат флага --port: '$2'"
+                    echo "Используйте шаблон порт_хоста:порт_контейнера (например, -p 8080:80)."
+                    exit 1
+                fi
+                PORT_MAP="$2"
+                shift 2
+            else
+                echo "Ошибка: Флаг $1 требует указания портов."
                 exit 1
             fi
             ;;
