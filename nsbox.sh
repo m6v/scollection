@@ -10,15 +10,16 @@ usage() {
     echo "Использование: $0 [ОПЦИИ]"
     echo ""
     echo "Опции:"
-    echo " -c, --command 'команда'       Выполнить команду в изолированном контейнере"
-    echo " --clean                       Сбросить все прошлые изменения в контейнере"
-    echo " -n, --net                     Включить изолированную сеть с доступом в интернет"
-    echo " -p, --port 'хост:гость'       Пробросить порт наружу, например, -p 8080:80"
-    echo " -m, --memory 'лимит'          Задать лимит оперативной памяти, например, -m 1G или -m 256M"
-    echo " --cpu 'доля'                  Задать лимит ядер CPU, например, --cpu 1 или --cpu 0.5"
-    echo " -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера"
-    echo "  -g, --gui                    Разрешить запуск графических приложений внутри контейнера"
-    echo " -h, --help                    Показать эту справку и выйти"
+    echo "  -c, --command 'команда'       Выполнить команду в изолированном контейнере"
+    echo "  --clean                       Сбросить все прошлые изменения в контейнере"
+    echo "  -n, --net                     Включить изолированную сеть с доступом в интернет"
+    echo "  -p, --port 'хост:контейнер'   Пробросить порт контейнера наружу, например, -p 8080:80"
+    echo "  -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера"
+    echo "  -m, --memory 'лимит'          Задать лимит оперативной памяти, например, -m 1G или -m 256M"
+    echo "  --cpu 'доля'                  Задать лимит ядер CPU, например, --cpu 1 или --cpu 0.5"
+    echo "  -g, --gui                     Разрешить запуск графических приложений внутри контейнера"
+    echo "  -d, --detach                  Запустить контейнер в фоновом режиме (демон)"
+    echo "  -h, --help                    Показать эту справку и выйти"
     exit 1
 }
 
@@ -34,7 +35,7 @@ MERGED_DIR="$BASE_DIR/merged"
 
 VOLUME_MAP=""
 
-BRIDGE_NAME="br-nsbox"
+BRIDGE_NAME="nsboxbr"
 VETH_HOST="veth-$$"  # Динамическое имя адаптера хоста
 VETH_GUEST="veth-guest"
 NET_NAME="container_net"
@@ -46,162 +47,74 @@ CLEAN_UPPER=false
 IS_NET_ENABLED=false
 IS_GUI_ENABLED=false
 
+# Путь к cgroup контейнера
 CGROUP_PATH="/sys/fs/cgroup/nsbox"
 
-# Настройка сетевого пространства на хосте
-setup_network() {
-    if [ "$IS_NET_ENABLED" != true ]; then
-        echo "" > "$MERGED_DIR/etc/resolv.conf"
-        return 0
-    fi
+run_nsbox_container() {
+    # Выполняем команду unshare, после чего запускаем команду, записанную в NET_PREFIX,
+    # после выполнения команды из NET_PREFIX запускаем команду bash (паровозик команд)
+    unshare --mount --pid --fork --propagation private $NET_PREFIX bash -c "
+        mount --bind '$MERGED_DIR' '$MERGED_DIR'
+        pivot_root '$MERGED_DIR' '$MERGED_DIR/old_root'
+        cd /
+        awk '{print $4}' /proc/self/stat > /old_root/run/nsbox.pid 2>/dev/null || true
+        # Изоляция дисков внутри контейнера
+        mount --make-rprivate /
 
-    if [ "$SET_IP" = "10.0.0.1" ]; then
-        echo "Ошибка: Адрес $SET_IP занят виртуальным мостом хоста (шлюзом)."
-        exit 1
-    fi
-
-    echo "Настройка сети через виртуальный мост $BRIDGE_NAME..."
-
-    if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME"; fi
-
-    if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
-        ip link add "$BRIDGE_NAME" type bridge
-        ip addr add 10.0.0.1/24 dev "$BRIDGE_NAME"
-        ip link set "$BRIDGE_NAME" up
-
-        sysctl -w net.ipv4.ip_forward=1 > /dev/null
-        nft add table ip nsbox_nat 2>/dev/null || true
-        nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
-        nft add rule ip nsbox_nat postrouting oifname "$HOST_IFACE" ip saddr 10.0.0.0/24 masquerade 2>/dev/null || true
-    fi
-
-    if [ "$SET_IP" = "auto" ]; then
-        # Если включен авторежим, циклом от .2 до .254 и ищем первый свободный IP
-        for i in {2..254}; do
-            # Проверяем, не выдан ли уже этот IP какому-то активному сетевому пространству имен
-            if ! ip netns exec "$NET_NAME" ip addr show 2>/dev/null | grep -q "10.0.0.$i/"; then
-                # Проверяем, нет ли его в ARP-таблице соседей нашего моста
-                if ! ip neighbor show dev "$BRIDGE_NAME" | grep -q "10.0.0.$i "; then
-                    SET_IP="10.0.0.$i"
-                    break
-                fi
+        # Нативно крепим графические кабели хоста прямо в новый корень контейнера
+        if [ '$IS_GUI_ENABLED' = true ]; then
+            # Монтируем сокет X11
+            mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
+            
+            # Монтируем сокет Wayland (если он есть)
+            if [ -n '$WAYLAND_DISPLAY' ]; then
+                mount --bind '/old_root$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY' '$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY'
             fi
-        done
-        # Если цикл завершился, а переменная осталась пустой — сеть переполненна
-        if [ -z "$SET_IP" ]; then
-            echo "Ошибка: Не удалось автоматически выделить IP-адрес. В подсети 10.0.0.0/24 не осталось свободных адресов!"
-            exit 1
         fi
-    fi
 
-    echo "Контейнеру выделен IP-адрес $SET_IP"
-
-    ip netns add "$NET_NAME"
-    ip link add "$VETH_HOST" type veth peer name "$VETH_GUEST" netns "$NET_NAME"
-
-    ip link set "$VETH_HOST" master "$BRIDGE_NAME"
-    ip link set "$VETH_HOST" up
-
-    # Нативно присваиваем вычисленный или указанный адрес
-    ip netns exec "$NET_NAME" ip link set "$VETH_GUEST" up
-    ip netns exec "$NET_NAME" ip addr add "$SET_IP/24" dev "$VETH_GUEST"
-    ip netns exec "$NET_NAME" ip route add default via 10.0.0.1
-
-    cp -L /etc/resolv.conf "$MERGED_DIR/etc/resolv.conf" 2>/dev/null || true
-
-    if [ -n "$PORT_MAP" ]; then
-        # Разрезаем порты по двоеточию
-        HOST_PORT=$(echo "$PORT_MAP" | cut -d':' -f1)
-        GUEST_PORT=$(echo "$PORT_MAP" | cut -d':' -f2)
-
-        echo "Активирован проброс порта: хост $HOST_PORT -> контейнер $SET_IP:$GUEST_PORT"
-
-        # Принудительно разрешаем ядру хоста перенаправлять локальный трафик (127.0.0.1) в сеть нашего моста!
-        sysctl -w net.ipv4.conf.all.route_localnet=1 > /dev/null
-        sysctl -w net.ipv4.conf."$BRIDGE_NAME".route_localnet=1 > /dev/null
-
-        # DNAT для внешнего трафика (Prerouting)
-        nft add chain ip nsbox_nat prerouting { type nat hook prerouting priority -100 \; } 2>/dev/null || true
-        nft add rule ip nsbox_nat prerouting tcp dport "$HOST_PORT" dnat to "$SET_IP:$GUEST_PORT" 2>/dev/null || true
+        if [ -n '$VOLUME_MAP' ]; then
+            mkdir -p '$GUEST_PATH'
+            mount --bind '/old_root/$HOST_PATH' '$GUEST_PATH'
+        fi
         
-        # DNAT для локального трафика хоста (Output)
-        nft add chain ip nsbox_nat output { type nat hook output priority -100 \; } 2>/dev/null || true
-        nft add rule ip nsbox_nat output tcp dport "$HOST_PORT" dnat to "$SET_IP:$GUEST_PORT" 2>/dev/null || true
+        # Монтирование системных ФС в правильном контексте
+        mount -t proc proc /proc
+        mount -t sysfs sysfs /sys
+        mount -t devpts devpts /dev/pts
+        mount -t tmpfs tmpfs /run
+        
+        # Размонтирование корня хоста внутри контейнера
+        umount -l /old_root
+        
+        # Активация локальной петлю внутри контейнера
+        ip link set lo up
 
-        # Синхоронизатор обратного пути (Postrouting SNAT), маскируем пакеты, идущие от хоста к контейнеру
-        # через мост br-nsbox, и заставляет контейнер слать ответ на 10.0.0.1
-        nft add rule ip nsbox_nat postrouting ip daddr "$SET_IP" tcp dport "$GUEST_PORT" masquerade 2>/dev/null || true
-    fi
+        # Экспорт переменных окружения контейнера
+        exec env -i bash -c '
+            export HOME=/root
+            export TERM=$TERM
+            export LANG=C.UTF-8
+            export LC_CTYPE=C.UTF-8
+            export LC_ALL=C.UTF-8
+            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+            if [ '$IS_GUI_ENABLED' = true ]; then
+                export DISPLAY='$DISPLAY'
+                export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'
+                # Создаем чременную папку рантайма прямо в изолированном /run контейнера.
+                mkdir -p /run/user/0
+                export XDG_RUNTIME_DIR=/run/user/0
+                export NO_AT_BRIDGE=1
+                export XAUTHORITY=/root/.Xauthority
+                # Запуск сессионной шины, которая в свою очередь запустит $COMMAND
+                exec dbus-run-session -- '$COMMAND'
+            else
+                exec '$COMMAND'
+            fi
+        '
+    "
 }
-
-# Настройка графического окружения
-setup_gui() {
-    if [ "$IS_GUI_ENABLED" = true ]; then
-        echo "Подготовка безопасной инфраструктуры X11..."
-        mkdir -p "$MERGED_DIR/tmp/.X11-unix"
-
-        # Если на хосте используется Wayland
-        if [ -n "$WAYLAND_DISPLAY" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
-            mkdir -p "$MERGED_DIR$XDG_RUNTIME_DIR"
-        fi
-            
-        # Напрямую получаем путь к активному ключу X11 из параметров запущенного графического сервера хоста
-        REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' | head -n 1 | cut -d' ' -f2)
-            
-        # Если секретный файл успешно обнаружен — копируем его в контейнер
-        if [ -n "$REAL_XAUTH" ] && [ -f "$REAL_XAUTH" ]; then
-            mkdir -p "$MERGED_DIR/root"
-            cp -L "$REAL_XAUTH" "$MERGED_DIR/root/.Xauthority" 2>/dev/null || true
-            echo "Ключ авторизации X11 $REAL_XAUTH успешно импортирован."
-        else
-            echo "Предупреждение: Активный файл авторизации X11 не обнаружен."
-        fi
-            
-        # Закрываем шлюз хоста
-        xhost -local: >/dev/null 2>&1 || true
-    fi
-}
-
-# Настройка контрольных групп
-setup_cgroups() {
-    # Если задан хотя бы один из лимитов (память или процессор)
-    if [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
-        echo "Настройка контроля ресурсов cgroups v2..."
-        mkdir -p "$CGROUP_PATH"
-        echo $$ > "$CGROUP_PATH/cgroup.procs"
-
-        # Применяем лимит оперативной памяти, если он указан
-        if [ -n "$MEM_LIMIT" ]; then
-            echo "Лимит оперативной памяти зафиксирован: $MEM_LIMIT"
-            echo "$MEM_LIMIT" > "$CGROUP_PATH/memory.max"
-        fi
-
-        # Применяем лимит процессора, если он указан
-        if [ -n "$CPU_LIMIT" ]; then
-            echo "Лимит ядер CPU зафиксирован: $CPU_LIMIT"
-            
-            # Нативная конвертация долей ядер в микросекунды для cgroups v2.
-            # Чтобы Bash мог умножать дроби без утилиты bc, мы делим логику:
-            # Умножаем значение на 100000, используя встроенный механизм Bash printf/awk
-            CPU_QUOTA=$(awk "BEGIN {print int($CPU_LIMIT * 100000)}")
-            
-            echo "$CPU_QUOTA 100000" > "$CGROUP_PATH/cpu.max"
-        fi
-    fi
-}
-
-sanitize_accounts() {
-    echo "Очистка базы пользователей контейнера..."
-    
-    # Создаем папку etc в верхнем слое изменений (upper), если её ещё нет
-    mkdir -p "$UPPER_DIR/etc"
-    # Фильтрация пользователей
-    awk -F: '$3 < 1000 || $3 == 65534' /etc/passwd > "$UPPER_DIR/etc/passwd"
-    # ПФильтрация групп
-    awk -F: '$3 < 1000 || $3 == 65534' /etc/group > "$UPPER_DIR/etc/group"
-    # Задаем безопасные права доступа
-    chmod 644 "$UPPER_DIR/etc/passwd" "$UPPER_DIR/etc/group"
-}
+export -f run_nsbox_container
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -223,12 +136,12 @@ while [ $# -gt 0 ]; do
             IS_NET_ENABLED=true
             # Если следующего аргумента нет или это другой флаг (начинается с '-')
             if [[ -z "$2" ]] || [[ "$2" =~ ^- ]]; then
-                SET_IP="auto" # Включаем чистый автопилот
+                GUEST_IP="auto" # Включаем чистый автопилот
                 shift 1       # Сдвигаем только сам флаг --net
                 
             # Если следующий аргумент — это валидный IP-адрес
             elif [[ "$2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                SET_IP="$2"   # Жестко фиксируем статический адрес
+                GUEST_IP="$2"   # Жестко фиксируем статический адрес
                 shift 2       # Сдвигаем и флаг, и сам IP-адрес
                 
             # Аргумент передан, но это не флаг и не валидный IP (опечатка!)
@@ -305,6 +218,11 @@ while [ $# -gt 0 ]; do
             IS_GUI_ENABLED=true
             shift 1
             ;;
+        -d|--detach)
+            echo "Предупреждение: Запуск контейнера в фоновом режиме пока не реализован"
+            IS_DETACHED=true
+            shift 1
+            ;;
         -h|--help)
             usage
             ;;
@@ -360,7 +278,7 @@ if ! mountpoint -q "$MERGED_DIR"; then
     mount -t overlay overlay -o lowerdir="$ROOT_DIR",upperdir="$UPPER_DIR",workdir="$WORK_DIR" "$MERGED_DIR"
 fi
 
-# Каталог, используемый для старого корня при рокировке корней
+# Создание каталога, используемого для старого корня при рокировке корней
 mkdir -p "$MERGED_DIR/old_root"
 
 # Запись правил Readline для контейнера для корректной работы с киррилицей
@@ -373,14 +291,145 @@ set meta-flag on
 set byte-oriented off
 EOF
 
-# Настройка пользователей и групп
-sanitize_accounts
-# Настройка контрольных групп
-setup_cgroups
+echo "Очистка базы пользователей контейнера..."
+# Создаем каталог etc в верхнем слое
+mkdir -p "$UPPER_DIR/etc"
+# Фильтрация системных пользователей
+awk -F: '$3 < 1000 || $3 == 65534' /etc/passwd > "$UPPER_DIR/etc/passwd"
+# Фильтрация системных групп
+awk -F: '$3 < 1000 || $3 == 65534' /etc/group > "$UPPER_DIR/etc/group"
+chmod 644 "$UPPER_DIR/etc/passwd" "$UPPER_DIR/etc/group"
+
+# Если задан хотя бы один из лимитов (память или процессор) настроить cgroup
+if [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
+    echo "Настройка контроля ресурсов cgroups v2..."
+    mkdir -p "$CGROUP_PATH"
+    echo $$ > "$CGROUP_PATH/cgroup.procs"
+
+    # Применение лимита оперативной памяти, если указан
+    if [ -n "$MEM_LIMIT" ]; then
+        echo "Лимит оперативной памяти зафиксирован: $MEM_LIMIT"
+        echo "$MEM_LIMIT" > "$CGROUP_PATH/memory.max"
+    fi
+
+    # Применение лимита процессора, если указан
+    if [ -n "$CPU_LIMIT" ]; then
+        echo "Лимит ядер CPU зафиксирован: $CPU_LIMIT"
+        # Конвертация долей ядер в микросекунды для cgroups v2, путем умножения на 100000
+        CPU_QUOTA=$(awk "BEGIN {print int($CPU_LIMIT * 100000)}")
+        echo "$CPU_QUOTA 100000" > "$CGROUP_PATH/cpu.max"
+    fi
+fi
+
 # Настройка сетевого пространства на хосте
-setup_network
+if [ "$IS_NET_ENABLED" != true ]; then
+    echo "" > "$MERGED_DIR/etc/resolv.conf"
+    return 0
+fi
+
+if [ "$GUEST_IP" = "10.0.0.1" ]; then
+    echo "Ошибка: Адрес $GUEST_IP занят виртуальным мостом хоста (шлюзом)."
+    exit 1
+fi
+
+echo "Настройка сети через виртуальный мост $BRIDGE_NAME..."
+if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME"; fi
+
+if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
+    ip link add "$BRIDGE_NAME" type bridge
+    ip addr add 10.0.0.1/24 dev "$BRIDGE_NAME"
+    ip link set "$BRIDGE_NAME" up
+
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    nft add table ip nsbox_nat 2>/dev/null || true
+    nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+    nft add rule ip nsbox_nat postrouting oifname "$HOST_IFACE" ip saddr 10.0.0.0/24 masquerade 2>/dev/null || true
+fi
+
+if [ "$GUEST_IP" = "auto" ]; then
+    # Если включен авторежим, циклом от .2 до .254 и ищем первый свободный IP
+    for i in {2..254}; do
+        # Проверяем, не выдан ли уже этот IP какому-то активному сетевому пространству имен
+        if ! ip netns exec "$NET_NAME" ip addr show 2>/dev/null | grep -q "10.0.0.$i/"; then
+            # Проверяем, нет ли его в ARP-таблице соседей нашего моста
+            if ! ip neighbor show dev "$BRIDGE_NAME" | grep -q "10.0.0.$i "; then
+                GUEST_IP="10.0.0.$i"
+                break
+            fi
+        fi
+    done
+    # Если цикл завершился, а переменная осталась пустой — сеть переполненна
+    if [ -z "$GUEST_IP" ]; then
+        echo "Ошибка: Не удалось автоматически выделить IP-адрес. В подсети 10.0.0.0/24 не осталось свободных адресов!"
+        exit 1
+    fi
+fi
+echo "Контейнеру выделен IP-адрес $GUEST_IP"
+
+ip netns add "$NET_NAME"
+ip link add "$VETH_HOST" type veth peer name "$VETH_GUEST" netns "$NET_NAME"
+
+ip link set "$VETH_HOST" master "$BRIDGE_NAME"
+ip link set "$VETH_HOST" up
+
+# Нативно присваиваем вычисленный или указанный адрес
+ip netns exec "$NET_NAME" ip link set "$VETH_GUEST" up
+ip netns exec "$NET_NAME" ip addr add "$GUEST_IP/24" dev "$VETH_GUEST"
+ip netns exec "$NET_NAME" ip route add default via 10.0.0.1
+
+cp -L /etc/resolv.conf "$MERGED_DIR/etc/resolv.conf" 2>/dev/null || true
+
+if [ -n "$PORT_MAP" ]; then
+    # Разрезаем порты по двоеточию
+    HOST_PORT=$(echo "$PORT_MAP" | cut -d':' -f1)
+    GUEST_PORT=$(echo "$PORT_MAP" | cut -d':' -f2)
+
+    echo "Активация проброса порта: хост $HOST_PORT -> контейнер $GUEST_IP:$GUEST_PORT..."
+
+    # Принудительно разрешаем на хосте перенаправление локального трафика (127.0.0.1) в сеть виртуального моста
+    sysctl -w net.ipv4.conf.all.route_localnet=1 > /dev/null
+    sysctl -w net.ipv4.conf."$BRIDGE_NAME".route_localnet=1 > /dev/null
+    # Очистка старых цепочек NAT
+    nft flush table ip nsbox_nat 2>/dev/null || true
+    # Добавление цепочки prerouting (для пакетов из внешнего мира)
+    nft add chain ip nsbox_nat prerouting { type nat hook prerouting priority -100 \; } 2>/dev/null || true
+    # Выполнение DNAT только для пакетов поступивших извне на реальную сетевую карту хоста,
+    # при этом трафик внутри моста 10.0.0.X это правило игнорирует
+    nft add rule ip nsbox_nat prerouting iifname "$HOST_IFACE" tcp dport "$HOST_PORT" dnat to "$GUEST_IP:$GUEST_PORT" 2>/dev/null || true
+    # Добавление цепочки output (для пакетов, рожденных на самом хосте через localhost)
+    nft add chain ip nsbox_nat output { type nat hook output priority -100 \; } 2>/dev/null || true
+    # Выполнение локального DNAT только если вы явно стучитесь на 127.0.0.1 (интерфейс lo)!
+    nft add rule ip nsbox_nat output oifname "lo" tcp dport "$HOST_PORT" dnat to "$GUEST_IP:$GUEST_PORT" 2>/dev/null || true
+    # Маскарадинг (SNAT) для обратного пути
+    nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+    nft add rule ip nsbox_nat postrouting ip daddr "$GUEST_IP" tcp dport "$GUEST_PORT" masquerade 2>/dev/null || true
+fi
+
 # Настройка графического окружения
-setup_gui
+if [ "$IS_GUI_ENABLED" = true ]; then
+    echo "Подготовка безопасной инфраструктуры X11..."
+    mkdir -p "$MERGED_DIR/tmp/.X11-unix"
+
+    # Если на хосте используется Wayland
+    if [ -n "$WAYLAND_DISPLAY" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+        mkdir -p "$MERGED_DIR$XDG_RUNTIME_DIR"
+    fi
+        
+    # Напрямую получаем путь к активному ключу X11 из параметров запущенного графического сервера хоста
+    REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' | head -n 1 | cut -d' ' -f2)
+        
+    # Если секретный файл успешно обнаружен — копируем его в контейнер
+    if [ -n "$REAL_XAUTH" ] && [ -f "$REAL_XAUTH" ]; then
+        mkdir -p "$MERGED_DIR/root"
+        cp -L "$REAL_XAUTH" "$MERGED_DIR/root/.Xauthority" 2>/dev/null || true
+        echo "Ключ авторизации X11 $REAL_XAUTH успешно импортирован."
+    else
+        echo "Предупреждение: Активный файл авторизации X11 не обнаружен."
+    fi
+        
+    # Закрываем шлюз хоста
+    xhost -local: >/dev/null 2>&1 || true
+fi
 
 # Подготовка путей для проброса каталога в контейнер
 if [ -n "$VOLUME_MAP" ]; then
@@ -392,67 +441,8 @@ if [ -n "$VOLUME_MAP" ]; then
     mkdir -p "$MERGED_DIR$GUEST_PATH"
 fi
 
-# Выполняем команду unshare, после чего запускаем команду, записанную в NET_PREFIX,
-# после выполнения команды из NET_PREFIX запускаем команду bash (паровозик команд)
-unshare --mount --pid --fork --propagation private $NET_PREFIX bash -c "
-    mount --bind '$MERGED_DIR' '$MERGED_DIR'
-    pivot_root '$MERGED_DIR' '$MERGED_DIR/old_root'
-    cd /
-    # Изоляция дисков внутри контейнера
-    mount --make-rprivate /
-
-    # Нативно крепим графические кабели хоста прямо в новый корень контейнера
-    if [ '$IS_GUI_ENABLED' = true ]; then
-        # Монтируем сокет X11
-        mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
-        
-        # Монтируем сокет Wayland (если он есть)
-        if [ -n '$WAYLAND_DISPLAY' ]; then
-            mount --bind '/old_root$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY' '$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY'
-        fi
-    fi
-
-    if [ -n '$VOLUME_MAP' ]; then
-        mkdir -p '$GUEST_PATH'
-        mount --bind '/old_root/$HOST_PATH' '$GUEST_PATH'
-    fi
-    
-    # Монтирование системных ФС в правильном контексте
-    mount -t proc proc /proc
-    mount -t sysfs sysfs /sys
-    mount -t devpts devpts /dev/pts
-    mount -t tmpfs tmpfs /run
-    
-    # Размонтирование корня хоста внутри контейнера
-    umount -l /old_root
-    
-    # Активация локальной петлю внутри контейнера
-    ip link set lo up
-
-    # Экспорт переменных окружения контейнера
-    exec env -i bash -c '
-        export HOME=/root
-        export TERM=$TERM
-        export LANG=C.UTF-8
-        export LC_CTYPE=C.UTF-8
-        export LC_ALL=C.UTF-8
-        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-        if [ '$IS_GUI_ENABLED' = true ]; then
-            export DISPLAY='$DISPLAY'
-            export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'
-            # Создаем чременную папку рантайма прямо в изолированном /run контейнера.
-            mkdir -p /run/user/0
-            export XDG_RUNTIME_DIR=/run/user/0
-            export NO_AT_BRIDGE=1
-            export XAUTHORITY=/root/.Xauthority
-            # Запуск сессионной шины, которая в свою очередь запустит $COMMAND
-            exec dbus-run-session -- '$COMMAND'
-        else
-            exec '$COMMAND'
-        fi
-    '
-"
+# Запуск контейнера
+run_nsbox_container
 
 # Удаление точки монтирования из верхнего слоя изменений
 if [ -n "$VOLUME_MAP" ] && [ -d "$UPPER_DIR$GUEST_PATH" ]; then
@@ -466,8 +456,9 @@ if mountpoint -q "$BASE_DIR"; then umount -l "$BASE_DIR" ; fi
 
 if [ "$IS_NET_ENABLED" = true ]; then
     echo "Очистка сетевых ресурсов хоста..."
-    if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME"; fi
+    if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME" 2>/dev/null || true; fi
     # Удаляем хостовый конец нашего динамического провода veth-$$
+    ip link set dev "$VETH_HOST" down 2>/dev/null || true
     ip link delete "$VETH_HOST" 2>/dev/null || true
 fi
 
