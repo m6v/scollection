@@ -13,6 +13,8 @@ usage() {
     echo " -c, --command 'команда'       Выполнить команду в изолированном контейнере"
     echo " --clean                       Сбросить все прошлые изменения в контейнере"
     echo " -n, --net                     Включить изолированную сеть с доступом в интернет"
+    echo " -m, --memory 'лимит'          Задать лимит оперативной памяти (например, -m 1G или -m 256M)"
+    echo " --cpu 'доля'                  Задать лимит ядер CPU (например, --cpu 1 или --cpu 0.5)"
     echo " -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера"
     echo " -h, --help                    Показать эту справку и выйти"
     exit 1
@@ -100,7 +102,7 @@ setup_network() {
     ip netns exec "$NET_NAME" ip addr add "$SET_IP/24" dev "$VETH_GUEST"
     ip netns exec "$NET_NAME" ip route add default via 10.0.0.1
 
-    echo "nameserver 8.8.8.8" > "$MERGED_DIR/etc/resolv.conf"
+    cp -L /etc/resolv.conf "$MERGED_DIR/etc/resolv.conf" 2>/dev/null || true
 }
 
 while [ $# -gt 0 ]; do
@@ -144,6 +146,37 @@ while [ $# -gt 0 ]; do
                 shift 2
             else
                 echo "Ошибка: Флаг $1 требует указания путей через двоеточие 'хост:контейнер'."
+                exit 1
+            fi
+            ;;
+        -m|--memory)
+            if [ -n "$2" ]; then
+                if [[ "$2" =~ ^[0-9]+[kKmMgG]$ ]]; then
+                    MEM_LIMIT="$2"
+                    shift 2
+                else
+                    echo "Ошибка: Неверный формат лимита памяти: '$2'"
+                    echo "Используйте шаблон из цифр и букв K, M, G (например: -m 256M или --memory 1G)."
+                    exit 1
+                fi
+            else
+                echo "Ошибка: Флаг $1 требует указания лимита памяти."
+                exit 1
+            fi
+            ;;
+        --cpu)
+            if [ -n "$2" ]; then
+                # Проверяем формат регулярным выражением (целое число или дробь через точку)
+                if [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+                    CPU_LIMIT="$2"
+                    shift 2
+                else
+                    echo "Ошибка: Неверный формат лимита CPU: '$2'"
+                    echo "Используйте целые числа или десятичные дроби (например: --cpu 1 или --cpu 0.5)."
+                    exit 1
+                fi
+            else
+                echo "Ошибка: Флаг --cpu требует указания лимита ядер."
                 exit 1
             fi
             ;;
@@ -215,11 +248,33 @@ set meta-flag on
 set byte-oriented off
 EOF
 
-echo "Включение контроля ресурсов cgroups v2 (512M)..."
+
 CGROUP_PATH="/sys/fs/cgroup/box_container"
-mkdir -p "$CGROUP_PATH"
-echo "512M" > "$CGROUP_PATH/memory.max"
-echo $$ > "$CGROUP_PATH/cgroup.procs"
+
+# Если задан хотя бы один из лимитов (память или процессор)
+if [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
+    echo "Настройка контроля ресурсов cgroups v2..."
+    mkdir -p "$CGROUP_PATH"
+    echo $$ > "$CGROUP_PATH/cgroup.procs"
+
+    # Применяем лимит оперативной памяти, если он указан
+    if [ -n "$MEM_LIMIT" ]; then
+        echo "Лимит оперативной памяти зафиксирован: $MEM_LIMIT"
+        echo "$MEM_LIMIT" > "$CGROUP_PATH/memory.max"
+    fi
+
+    # Применяем лимит процессора, если он указан
+    if [ -n "$CPU_LIMIT" ]; then
+        echo "Лимит ядер CPU зафиксирован: $CPU_LIMIT"
+        
+        # Нативная конвертация долей ядер в микросекунды для cgroups v2.
+        # Чтобы Bash мог умножать дроби без утилиты bc, мы делим логику:
+        # Умножаем значение на 100000, используя встроенный механизм Bash printf/awk
+        CPU_QUOTA=$(awk "BEGIN {print int($CPU_LIMIT * 100000)}")
+        
+        echo "$CPU_QUOTA 100000" > "$CGROUP_PATH/cpu.max"
+    fi
+fi
 
 # Настройка сетевого пространства на хосте
 setup_network
@@ -299,7 +354,7 @@ if [ "$IS_NET_ENABLED" = true ]; then
     ip link delete "$VETH_HOST" 2>/dev/null || true
 fi
 
-# # Удаление созданной группы cgroups v2
-if [ -d "/sys/fs/cgroup/box_container" ]; then
-    rmdir "/sys/fs/cgroup/box_container" 2>/dev/null || true
+# Удаление созданной группы cgroups v2, если была создана хотя бы одна настройка
+if { [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; } && [ -d "$CGROUP_PATH" ]; then
+    rmdir "$CGROUP_PATH" 2>/dev/null || true
 fi
