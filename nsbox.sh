@@ -1,5 +1,9 @@
 #!/bin/bash
+
+# Прерывать работу при любой ошибке (безопасный режим)
 set -e
+# Включить режим allexport, для передачи переменных окружения в nsinit.sh
+set -a
 
 # Повышение прав до root'а
 if [ "$EUID" -ne 0 ]; then
@@ -48,70 +52,6 @@ IS_GUI_ENABLED=false
 
 # Путь к cgroup контейнера
 CGROUP_PATH="/sys/fs/cgroup/nsbox"
-
-run_nsbox_container() {
-    # Выполняем команду unshare, после чего запускаем команду, записанную в NET_PREFIX,
-    # после выполнения команды из NET_PREFIX запускаем команду bash (паровозик команд)
-    unshare --mount --pid --fork --propagation private $NET_PREFIX bash -c "
-        mount --bind '$MERGED_DIR' '$MERGED_DIR'
-        pivot_root '$MERGED_DIR' '$MERGED_DIR/old_root'
-        cd /
-        # Изоляция дисков внутри контейнера
-        mount --make-rprivate /
-
-        # Монтируем сокет X11 в новый корень контейнера
-        if [ '$IS_GUI_ENABLED' = true ]; then
-            mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
-            # Монтируем сокет Wayland (если он есть)
-            if [ -n '$WAYLAND_DISPLAY' ]; then
-                mount --bind '/old_root$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY' '$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY'
-            fi
-        fi
-
-        if [ -n '$VOLUME_MAP' ]; then
-            mkdir -p '$GUEST_PATH'
-            mount --bind '/old_root/$HOST_PATH' '$GUEST_PATH'
-        fi
-        
-        # Монтирование системных ФС в правильном контексте
-        mount -t proc proc /proc
-        mount -t sysfs sysfs /sys
-        mount -t devpts devpts /dev/pts
-        mount -t tmpfs tmpfs /run
-        
-        # Размонтирование корня хоста внутри контейнера
-        umount -l /old_root
-        rmdir /old_root
-        
-        # Активация локальной петлю внутри контейнера
-        ip link set lo up
-
-        # Экспорт переменных окружения контейнера
-        exec env -i bash -c '
-            export HOME=/root
-            export TERM=$TERM
-            export LANG=C.UTF-8
-            export LC_CTYPE=C.UTF-8
-            export LC_ALL=C.UTF-8
-            export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-            if [ '$IS_GUI_ENABLED' = true ]; then
-                export DISPLAY='$DISPLAY'
-                export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'
-                # Создаем чременную папку рантайма прямо в изолированном /run контейнера.
-                mkdir -p /run/user/0
-                export XDG_RUNTIME_DIR=/run/user/0
-                export NO_AT_BRIDGE=1
-                export XAUTHORITY=/root/.Xauthority
-                # Запуск сессионной шины, которая в свою очередь запустит $COMMAND
-                exec dbus-run-session -- '$COMMAND'
-            else
-                exec '$COMMAND'
-            fi
-        '
-    "
-}
-export -f run_nsbox_container
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -205,7 +145,7 @@ while [ $# -gt 0 ]; do
             ;;
         --cpu)
             if [ -n "$2" ]; then
-                # Проверяем формат регулярным выражением (целое число или дробь через точку)
+                # Проверка формата регулярным выражением (целое число или дробь через точку)
                 if [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
                     CPU_LIMIT="$2"
                     shift 2
@@ -460,7 +400,7 @@ if [ -n "$VOLUME_MAP" ]; then
 fi
 
 # Запуск контейнера
-run_nsbox_container
+unshare --mount --pid --fork --propagation private $NET_PREFIX $(dirname "$(realpath "$0")")/nsinit.sh
 
 # Удаление точки монтирования из верхнего слоя изменений
 if [ -n "$VOLUME_MAP" ] && [ -d "$UPPER_DIR$GUEST_PATH" ]; then
