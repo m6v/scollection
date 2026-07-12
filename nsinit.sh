@@ -7,7 +7,7 @@ pivot_root "$MERGED_DIR" "$MERGED_DIR/old_root"
 cd /
 mount --make-rprivate /
 
-# 2. Безопасный проброс графических сокетов хоста
+# Проброс графических сокетов хоста
 if [ "$IS_GUI_ENABLED" = true ]; then
     mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
     if [ -n "$WAYLAND_DISPLAY" ]; then
@@ -30,6 +30,21 @@ mount -t tmpfs tmpfs /run
 # 5. Отрезаем старый корень хоста и поднимаем локальную петлю
 umount -l /old_root
 ip link set lo up
+
+if [ "$IS_NET_ENABLED" = true ]; then
+    echo "[nsinit] Нативно активирую сетевой интерфейс..."
+    
+    # 1. Сначала будим и включаем сам прилетевший veth-кабель
+    ip link set veth-guest up
+    
+    # 2. Нативно вешаем IP-адрес (с прошлого шага)
+    ip addr add "$GUEST_IP/24" dev veth-guest
+    
+    # 3. Прописываем маршрут по умолчанию (с прошлого шага)
+    ip route add default via 10.0.0.1
+    
+    echo "[nsinit] Сетевой стек успешно активирован! Гостевой IP: $GUEST_IP"
+fi
 
 # 6. Тотальная стерилизация переменных окружения и старт программы
 # Ваша любимая двойная кавычка стоит на своем абсолютно законном месте!

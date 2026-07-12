@@ -79,20 +79,19 @@ while [ $# -gt 0 ]; do
             ;;
         -n|--net)
             IS_NET_ENABLED=true
-            # Если следующего аргумента нет или это другой флаг (начинается с '-')
-            if [[ -z "$2" ]] || [[ "$2" =~ ^- ]]; then
-                GUEST_IP="auto" # Включаем чистый автопилот
-                shift 1       # Сдвигаем только сам флаг --net
-                
-            # Если следующий аргумент — это валидный IP-адрес
+            # Если аргумент $2 пустой, ИЛИ начинается с дефиса, 
+            # ИЛИ если аргумент $2 — это последний оставшийся аргумент строки ($# -eq 2),
+            # значит пользователь не передавал IP, а сразу написал имя контейнера!
+            if [[ -z "$2" ]] || [[ "$2" =~ ^- ]] || [ "$#" -eq 2 ]; then
+                GUEST_IP="auto"
+                shift 1
+            # Если это не имя контейнера и не флаг, проверяем строгий формат IP
             elif [[ "$2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                GUEST_IP="$2"   # Жестко фиксируем статический адрес
-                shift 2       # Сдвигаем и флаг, и сам IP-адрес
-                
-            # Аргумент передан, но это не флаг и не валидный IP (опечатка!)
+                GUEST_IP="$2"
+                shift 2
             else
                 echo "Ошибка: Неверный формат IP-адреса для флага --net: '$2'"
-                echo "Используйте валидный IP (например, --net 10.0.0.5) или оставьте флаг пустым для автовыбора."
+                echo "Используйте валидный IP (например, --net 10.0.0.5) или напишите просто --net для автовыбора."
                 exit 1
             fi
             ;;
@@ -191,7 +190,7 @@ if [ "$IS_NET_ENABLED" = true ]; then
     NET_PREFIX="nsenter --net=$NET_NS_FILE"
 else
     # Пустая сеть
-    NET_PREFIX="unshare --net"
+    NET_PREFIX="--net"
 fi
 
 if [ -z "$GUEST_NAME" ]; then
@@ -327,11 +326,6 @@ if [ "$IS_NET_ENABLED" = true ]; then
     ip link set "$VETH_HOST" master "$BRIDGE_NAME"
     ip link set "$VETH_HOST" up
 
-    # Нативно присваиваем вычисленный или указанный адрес
-    ip netns exec "$NET_NAME" ip link set "$VETH_GUEST" up
-    ip netns exec "$NET_NAME" ip addr add "$GUEST_IP/24" dev "$VETH_GUEST"
-    ip netns exec "$NET_NAME" ip route add default via 10.0.0.1
-
     cp -L /etc/resolv.conf "$MERGED_DIR/etc/resolv.conf" 2>/dev/null || true
 else
     echo "" > "$MERGED_DIR/etc/resolv.conf"
@@ -414,10 +408,22 @@ if mountpoint -q "$BASE_DIR"; then umount -l "$BASE_DIR" ; fi
 
 if [ "$IS_NET_ENABLED" = true ]; then
     echo "Очистка сетевых ресурсов хоста..."
-    if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME" 2>/dev/null || true; fi
-    # Удаляем хостовый конец нашего динамического провода veth-$$
-    ip link set dev "$VETH_HOST" down 2>/dev/null || true
-    ip link delete "$VETH_HOST" 2>/dev/null || true
+
+    # Гасим и удаляем виртуальный кабель хоста VETH_HOST, при этом
+    # ядро автоматически уничтожает гостевой конец veth-GUEST внутри контейнера
+    if ip link show "$VETH_HOST" >/dev/null 2>&1; then
+        ip link set dev "$VETH_HOST" down 2>/dev/null || true
+        ip link delete "$VETH_HOST" 2>/dev/null || true
+    fi
+
+    # Зачищаем пространство имен
+    if [ -e "$NET_NS_FILE" ]; then
+        # Лениво отмонтируем файл-маркер, разрывая любые зависшие мертвые связи с unshare
+        umount -l "$NET_NS_FILE" 2>/dev/null || true
+        
+        # Бесшумно и чисто удаляем пространство из системы
+        ip netns delete "$NET_NAME" 2>/dev/null || true
+    fi
 fi
 
 # Удаление созданной группы cgroups v2, если была создана хотя бы одна настройка
