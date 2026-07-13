@@ -5,27 +5,30 @@ set -e
 # Включить режим allexport, для передачи переменных окружения в nsinit.sh
 set -a
 
+usage() {
+cat << EOF
+Использование: $(basename "$0") [ОПЦИИ] имя_контейнера
+Выполняет команду, указанную в параметре -c, --command в изолированном контейнере.
+Без указания команды в контейнере запускается оболочка bash.
+
+Аргументы, обязательные для длинных параметров, обязательны и для коротких.
+  -c, --command 'команда'       Выполнить команду в изолированном контейнере
+  -l, --lower 'путь'            Указать каталог для нижнего слоя ФС контейнера (вместо корня хоста)
+  -n, --net 'auto | IP-адрес'   Использовать виртуальный адаптер, например, -n 10.0.0.5
+  -p, --port 'хост:контейнер'   Настроить трансляцию портов, например, -p 8080:80
+  -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера
+  -m, --memory 'лимит'          Задать лимит оперативной памяти, например, -m 1G или -m 256M
+  -C, --cpu 'доля'              Задать лимит ядер CPU, например, --cpu 1 или --cpu 0.5
+  -g, --gui                     Разрешить запуск графических приложений внутри контейнера
+  -h, --help                    Показать эту справку и выйти
+EOF
+exit 1
+}
+
 # Повышение прав до root'а
 if [ "$EUID" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
-
-usage() {
-    echo "Использование: $0 [ОПЦИИ] имя_контейнера"
-    echo ""
-    echo "Опции:"
-    echo "  -c, --command 'команда'       Выполнить команду в изолированном контейнере"
-    echo "  -l, --lower 'путь'            Указать каталог для нижнего слоя ФС контейнера (вместо корня хоста)"
-    echo "  -n, --net auto | ip_addr      Использовать виртуальный адаптер"
-    echo "  -p, --port 'хост:контейнер'   Пробросить порт контейнера наружу, например, -p 8080:80"
-    echo "  -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера"
-    echo "  -m, --memory 'лимит'          Задать лимит оперативной памяти, например, -m 1G или -m 256M"
-    echo "  --cpu 'доля'                  Задать лимит ядер CPU, например, --cpu 1 или --cpu 0.5"
-    echo "  -g, --gui                     Разрешить запуск графических приложений внутри контейнера"
-    echo "  -d, --detach                  Запустить контейнер в фоновом режиме (демон)"
-    echo "  -h, --help                    Показать эту справку и выйти"
-    exit 1
-}
 
 # Получение ключа авторизации X11 из параметров запущенного графического сервера хоста
 REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' | head -n 1 | cut -d' ' -f2)
@@ -69,7 +72,7 @@ while [ $# -gt 0 ]; do
                 COMMAND="$2"
                 shift 2
             else
-                echo "Ошибка: Флаг $1 требует указания команды в кавычках."
+                echo "Ошибка: Параметр $1 требует указания команды в кавычках."
                 echo ""
                 usage
             fi
@@ -83,52 +86,52 @@ while [ $# -gt 0 ]; do
                 LOWER_DIR=$(realpath "$2")
                 shift 2
             else
-                echo "Ошибка: Флаг --lower требует указания пути к каталогу."; exit 1
+                echo "Ошибка: Параметр --lower требует указания пути к каталогу."; exit 1
             fi
             ;;
-        --net)
-            # извлечение значения параметра сети, идущего следующим аргументом
+        -n|--net)
+            # Извлечение значения параметра сети, идущего следующим аргументом
             GUEST_IP="$2"
             
-            # регулярное выражение для строгой проверки каноничного формата ipv4
+            # Регулярное выражение для строгой проверки каноничного формата ipv4
             ipv4_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
 
-            # проверка на пустоту значения или попытку подставить следующий флаг запуска вместо адреса
+            # Проверка на пустоту значения или попытку подставить следующий параметр запуска вместо адреса
             if [ -z "$GUEST_IP" ] || [[ "$GUEST_IP" == -* ]]; then
-                echo "Ошибка: Флаг --net требует обязательного значения (IP-адрес или 'auto')!"
+                echo "Ошибка: Параметр --net требует обязательного значения (IP-адрес или 'auto')!"
                 exit 1
             fi
 
-            # проверка соответствия значения разрешенным параметрам auto или валидному ip
+            # Проверка соответствия значения разрешенным параметрам auto или валидному ip
             if [ "$GUEST_IP" != "auto" ] && [[ ! "$GUEST_IP" =~ $ipv4_regex ]]; then
-                echo "Ошибка: Некорректное значение флага --net. Допускается только IP-адрес или 'auto'!"
+                echo "Ошибка: Некорректное значение параметра --net. Допускается только IP-адрес или 'auto'!"
                 exit 1
             fi
 
-            # активация сетевого флага проекта при успешном прохождении валидации
+            # Активация сетевого параметра проекта при успешном прохождении валидации
             IS_NET_ENABLED=true
             shift 2
             ;;
         -p|--port)
             if [ -n "$2" ]; then
-                # Проверяем наличие двоеточия, если его нет — падаем!
+                # Проверка наличия двоеточия
                 if ! echo "$2" | grep -q ":"; then
-                    echo "Ошибка: Неверный формат флага --port: '$2'"
+                    echo "Ошибка: Неверный формат параметра --port: '$2'"
                     echo "Используйте шаблон порт_хоста:порт_контейнера (например, -p 8080:80)."
                     exit 1
                 fi
                 PORT_MAP="$2"
                 shift 2
             else
-                echo "Ошибка: Флаг $1 требует указания портов."
+                echo "Ошибка: Параметр $1 требует указания портов."
                 exit 1
             fi
             ;;
         -v|--volume)
             if [ -n "$2" ]; then
-                # Проверяем наличие двоеточия, если его нет — выдаем ошибку
+                # Проверка наличия двоеточия
                 if ! echo "$2" | grep -q ":"; then
-                    echo "Ошибка: Неверный формат флага --volume: '$2'"
+                    echo "Ошибка: Неверный формат параметра --volume: '$2'"
                     echo "Используйте шаблон путь_хоста:путь_контейнера (например, -v /tmp:/data)."
                     exit 1
                 fi
@@ -137,7 +140,7 @@ while [ $# -gt 0 ]; do
                 GUEST_PATH=$(echo "$VOLUME_MAP" | cut -d':' -f2)
                 shift 2
             else
-                echo "Ошибка: Флаг $1 требует указания путей монтирования."
+                echo "Ошибка: Параметр $1 требует указания путей монтирования."
                 exit 1
             fi
             ;;
@@ -152,11 +155,11 @@ while [ $# -gt 0 ]; do
                     exit 1
                 fi
             else
-                echo "Ошибка: Флаг $1 требует указания лимита памяти."
+                echo "Ошибка: Параметр $1 требует указания лимита памяти."
                 exit 1
             fi
             ;;
-        --cpu)
+        -C|--cpu)
             if [ -n "$2" ]; then
                 # Проверка формата регулярным выражением (целое число или дробь через точку)
                 if [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
@@ -168,7 +171,7 @@ while [ $# -gt 0 ]; do
                     exit 1
                 fi
             else
-                echo "Ошибка: Флаг --cpu требует указания лимита ядер."
+                echo "Ошибка: Параметр --cpu требует указания лимита ядер."
                 exit 1
             fi
             ;;
@@ -186,10 +189,10 @@ while [ $# -gt 0 ]; do
             ;;
         *)
             if [[ "$1" =~ ^- ]] || [ "$#" -ne 1 ]; then
-                echo "Неизвестный параметр: $1"
+                echo "Ошибка: Неизвестный параметр: $1"
                 usage
             fi
-            GUEST_NAME="$1"
+            CONTAINER_NAME="$1"
             shift 1
             ;;
     esac
@@ -204,24 +207,26 @@ else
     NET_PREFIX="--net"
 fi
 
-if [ -z "$GUEST_NAME" ]; then
+if [ -z "$CONTAINER_NAME" ]; then
     echo "Ошибка: Не указано имя контейнера"
     echo ""
     usage
 fi
 
-if [[ "$GUEST_NAME" == *"/"* ]]; then
-    echo "Ошибка: Задано недопустимое имя контейнера '$GUEST_NAME'."
-    echo "Имя должно быть простым идентификатором без слэшей."
+# Валидация имени контейнера на соответствие RFC 1123,
+hostname_regex="^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])$"
+
+if [[ ! "$CONTAINER_NAME" =~ $hostname_regex ]]; then
+    echo "Ошибка: Задано недопустимое имя контейнера '$CONTAINER_NAME'."
     exit 1
 fi
 
-# Динамически собираем пути к рантайму контейнера
-BASE_DIR="$REGISTRY_DIR/$GUEST_NAME"
+# Пути к рантайму контейнера
+BASE_DIR="$REGISTRY_DIR/$CONTAINER_NAME"
 UPPER_DIR="$BASE_DIR/upper"
 WORK_DIR="$BASE_DIR/work"
 MERGED_DIR="$BASE_DIR/merged"
-IMAGE_FILE="$BASE_DIR/$GUEST_NAME.img"
+IMAGE_FILE="$BASE_DIR/$CONTAINER_NAME.img"
 
 # Подготовка структуры каталогов рантайма контейнера
 mkdir -p "$ROOT_DIR" "$BASE_DIR"
@@ -261,7 +266,7 @@ set byte-oriented off
 EOF
 
 echo "Очистка базы пользователей контейнера..."
-# Создаем каталог etc в верхнем слое
+# Создание каталога etc в верхнем слое
 mkdir -p "$UPPER_DIR/etc"
 # Фильтрация системных пользователей
 awk -F: '$3 < 1000 || $3 == 65534' /etc/passwd > "$UPPER_DIR/etc/passwd"
@@ -269,7 +274,7 @@ awk -F: '$3 < 1000 || $3 == 65534' /etc/passwd > "$UPPER_DIR/etc/passwd"
 awk -F: '$3 < 1000 || $3 == 65534' /etc/group > "$UPPER_DIR/etc/group"
 chmod 644 "$UPPER_DIR/etc/passwd" "$UPPER_DIR/etc/group"
 
-# Если задан хотя бы один из лимитов (память или процессор) настроить cgroup
+# Настройка cgroup, если задан хотя бы один из лимитов (память или процессор)
 if [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
     echo "Настройка контроля ресурсов cgroups v2..."
     mkdir -p "$CGROUP_PATH"
@@ -293,10 +298,10 @@ fi
 # Настройка сетевого пространства на хосте
 if [ "$IS_NET_ENABLED" = true ]; then
     # Определение и экспорт ip-адреса и маски шлюза
-    export bridge_ip="${BRIDGE_CIDR%/*}"
-    export bridge_mask="${BRIDGE_CIDR#*/}"
+    export BRIDGE_IP="${BRIDGE_CIDR%/*}"
+    export BRIDGE_MASK="${BRIDGE_CIDR#*/}"
 
-    if [ "$GUEST_IP" = "$bridge_ip" ]; then
+    if [ "$GUEST_IP" = "$BRIDGE_IP" ]; then
         echo "Ошибка: Адрес $GUEST_IP занят виртуальным мостом хоста (шлюзом)."
         exit 1
     fi
@@ -313,14 +318,14 @@ if [ "$IS_NET_ENABLED" = true ]; then
 
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
     
-    # Инициализируем таблицу и базовую цепочку
+    # Инициализация таблицы NAT и базовой цепочки
     nft add table ip nsbox_nat 2>/dev/null || true
     nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
     
-    # Автоматический расчет адреса сети для маскарадинга
-    mask_num=$(( 0xFFFFFFFF << (32 - bridge_mask) ))
+    # Расчет адреса сети для маскарадинга
+    mask_num=$(( 0xFFFFFFFF << (32 - $BRIDGE_MASK) ))
     
-    IFS=. read -r i1 i2 i3 i4 <<< "$bridge_ip"
+    IFS=. read -r i1 i2 i3 i4 <<< "$BRIDGE_IP"
     bridge_num=$(( (i1 << 24) + (i2 << 16) + (i3 << 8) + i4 ))
     
     network_num=$(( bridge_num & mask_num ))
@@ -329,7 +334,7 @@ if [ "$IS_NET_ENABLED" = true ]; then
     net_addr="$(( (network_num >> 24) & 255 )).$(( (network_num >> 16) & 255 )).$(( (network_num >> 8) & 255 )).$(( network_num & 255 ))"
 
     # Маскарадинг подсети на основе вычисленного сетевого адреса
-    nft add rule ip nsbox_nat postrouting ip saddr "$net_addr/$bridge_mask" masquerade 2>/dev/null || true
+    nft add rule ip nsbox_nat postrouting ip saddr "$net_addr/$BRIDGE_MASK" masquerade 2>/dev/null || true
 
     # Автовыбор IP-адреса для контейнера, если GUEST_IP равен 'auto'
     if [ "$GUEST_IP" = "auto" ]; then
@@ -338,8 +343,8 @@ if [ "$IS_NET_ENABLED" = true ]; then
         end_num=$(( broadcast_num - 1 ))
 
         # Сбор занятых ipv4-адресов подсети
-        busy_ips=$( { ip addr show master "$BRIDGE_NAME"; ip neighbor show dev "$BRIDGE_NAME"; } 2>/dev/null | grep -oE "${bridge_ip%.*}\.[0-9]+" | tr '\n' ' ' )
-        busy_ips="$busy_ips $bridge_ip"
+        busy_ips=$( { ip addr show master "$BRIDGE_NAME"; ip neighbor show dev "$BRIDGE_NAME"; } 2>/dev/null | grep -oE "${BRIDGE_IP%.*}\.[0-9]+" | tr '\n' ' ' )
+        busy_ips="$busy_ips $BRIDGE_IP"
 
         # Перебор хостов внутри диапазона подсети
         GUEST_IP=""
@@ -384,10 +389,8 @@ if [ -n "$PORT_MAP" ]; then
     HOST_PORT="${PORT_MAP%%:*}"
     GUEST_PORT="${PORT_MAP#*:}"
 
-    # Вывод информационного сообщения об инициализации трансляции портов
     echo "Активация проброса порта: хост $HOST_PORT -> контейнер $GUEST_IP:$GUEST_PORT..."
-
-    # Атомарное создание таблицы маршрутизации ip-пакетов с именем nsbox_nat
+    # Создание таблицы маршрутизации ip-пакетов
     nft add table ip nsbox_nat 2>/dev/null || true
     
     # Создание цепочки предварительной маршрутизации для входящего сетевого трафика
@@ -397,12 +400,12 @@ if [ -n "$PORT_MAP" ]; then
 
     # Создание цепочки маршрутизации для исходящего трафика, генерируемого самим хостом
     nft add chain ip nsbox_nat output { type nat hook output priority -100 \; } 2>/dev/null || true
-    # dnat для локальных пакетов хоста, адресованных строго на ip-адрес шлюза моста
-    nft add rule ip nsbox_nat output ip daddr 10.0.0.1 tcp dport "$HOST_PORT" dnat to "$GUEST_IP:$GUEST_PORT" 2>/dev/null || true
+    # dnat для локальных пакетов хоста, адресованных на ip-адрес шлюза моста
+    nft add rule ip nsbox_nat output ip daddr "$BRIDGE_IP" tcp dport "$HOST_PORT" dnat to "$GUEST_IP:$GUEST_PORT" 2>/dev/null || true
 
     # Создание цепочки пост-маршрутизации для изменения сетевых адресов перед отправкой пакета
     nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
-    # Ммаскарадинг источника для корректного возврата ответов от контейнера к хосту
+    # Маскарадинг источника для корректного возврата ответов от контейнера к хосту
     nft add rule ip nsbox_nat postrouting ip daddr "$GUEST_IP" tcp dport "$GUEST_PORT" masquerade 2>/dev/null || true
 fi
 
@@ -421,8 +424,20 @@ if [ "$IS_GUI_ENABLED" = true ]; then
     # Копирование файла авторизации .Xauthority в виртуальное окно merged
     if [ -n "$REAL_XAUTH" ] && [ -f "$REAL_XAUTH" ]; then
         mkdir -p "$MERGED_DIR/root"
-        cp -L "$REAL_XAUTH" "$MERGED_DIR/root/.Xauthority" 2>/dev/null || true
-        echo "Ключ авторизации X11 $REAL_XAUTH успешно импортирован."
+
+        # NB! Следующий блок кода по созданию .Xauthority это "хакерское" решение,
+        # 
+        # Удаление старого файла, если он остался от прошлых запусков
+        rm -f "$MERGED_DIR/root/.Xauthority"
+        # Извлечение ключа хоста, подмена семейства адресов на ffff (wildcard)
+        # и сохранение файла в изолированную merged-директорию контейнера
+        xauth -f "$REAL_XAUTH" nlist "$DISPLAY" 2>/dev/null | sed -e 's/^..../ffff/' | xauth -f "$MERGED_DIR/root/.Xauthority" nmerge - 2>/dev/null || true
+        # Принудительная синхронизация кэша файловой системы
+        sync "$MERGED_DIR/root/.Xauthority"
+
+
+        # cp -L "$REAL_XAUTH" "$MERGED_DIR/root/.Xauthority" 2>/dev/null || true
+        # echo "Ключ авторизации X11 $REAL_XAUTH успешно импортирован."
     else
         echo "Предупреждение: Активный файл авторизации X11 не обнаружен по пути: '$REAL_XAUTH'"
     fi
@@ -442,7 +457,7 @@ if [ -n "$VOLUME_MAP" ]; then
 fi
 
 # Запуск контейнера
-unshare --mount --pid --fork --propagation private $NET_PREFIX $(dirname "$(realpath "$0")")/nsinit.sh
+unshare --mount --pid --uts --fork --propagation private $NET_PREFIX $(dirname "$(realpath "$0")")/nsinit.sh
 
 # Удаление точки монтирования из верхнего слоя изменений
 if [ -n "$VOLUME_MAP" ] && [ -d "$UPPER_DIR$GUEST_PATH" ]; then

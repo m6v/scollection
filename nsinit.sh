@@ -3,7 +3,7 @@
 # Прерывать работу при любой ошибке (безопасный режим)
 set -e
 
-# Самопривязка монтирования для подстраховки на случай, если при модификации кода
+# Самопривязка монтирования на случай, если при модификации кода
 # MERGED_DIR окажется не точкой монтирования, а обычным каталогом, 
 # тогда pivot_root не сработает или сработает, но последующий umount -l /old_root убьет систему
 mount --bind "$MERGED_DIR" "$MERGED_DIR"
@@ -18,8 +18,14 @@ mount -t sysfs sysfs /sys
 mount -t devpts devpts /dev/pts
 mount -t tmpfs tmpfs /run
 
+# Назначение имени узла
+[ -z "$CONTAINER_NAME" ] && CONTAINER_NAME="nsbox"
+hostname "$CONTAINER_NAME"
+echo "127.0.0.1 localhost $CONTAINER_NAME" > /etc/hosts
+
 # Проброс графических сокетов хоста
 if [ "$IS_GUI_ENABLED" = true ]; then
+    # стандартный проброс сокетов X11
     mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
 fi
 
@@ -29,31 +35,36 @@ if [ -n "$VOLUME_MAP" ]; then
     mount --bind "/old_root/$HOST_PATH" "$GUEST_PATH"
 fi
 
-# Расмонтирование старого корня хоста и поднятие локальной петли
+# Размонтирование старого корня хоста
 umount -l /old_root
+rmdir /old_root
+
 ip link set lo up
 
 if [ "$IS_NET_ENABLED" = true ]; then
     echo "Активация сетевого интерфейса контейнера..."
     
-    # включаем проброшенный виртуальный кабель
+    # Включение проброшенного виртуального кабеля
     ip link set veth-guest up
     
-    # фолбэк для маски подсети (если переменная пуста, откатываемся на /24)
-    [ -z "$bridge_mask" ] && bridge_mask="24"
+    # Фолбэк для маски подсети (если переменная пуста, откатываемся на /24)
+    [ -z "$BRIDGE_MASK" ] && BRIDGE_MASK="24"
 
     # Присваиваение ip-адреса и актуальной маской хоста
-    ip addr add "$GUEST_IP/$bridge_mask" dev veth-guest
+    ip addr add "$GUEST_IP/$BRIDGE_MASK" dev veth-guest
     
-    # Маршрут по умолчанию через переданный bridge_ip
-    [ -z "$bridge_ip" ] && bridge_ip="10.0.0.1"
-    ip route add default via "$bridge_ip"
+    # Маршрут по умолчанию через переданный BRIDGE_IP
+    [ -z "$BRIDGE_IP" ] && BRIDGE_IP="10.0.0.1"
+    ip route add default via "$BRIDGE_IP"
     
-    echo "Сетевой стек контейнера успешно активирован, IP: $GUEST_IP/$bridge_mask"
+    echo "Сетевой стек контейнера успешно активирован, IP: $GUEST_IP/$BRIDGE_MASK"
 fi
 
-# Если COMMAND не определена запускать bash
+# Запуск bash, если COMMAND не определена
 COMMAND="${COMMAND:-bash}"
+
+echo "DISPLAY: $DISPLAY"
+[ -z "$DISPLAY" ] && DISPLAY=":0"
 
 # Стерилизация переменных окружения (env -i) и запуск $COMMAND
 exec env -i bash -c "
@@ -70,7 +81,7 @@ exec env -i bash -c "
         export XDG_RUNTIME_DIR=/run/user/0
         export NO_AT_BRIDGE=1
         export XAUTHORITY=/root/.Xauthority
-        export DBUS_SESSION_BUS_ADDRESS
+        # export DBUS_SESSION_BUS_ADDRESS
         exec dbus-run-session -- $COMMAND
     else
         exec $COMMAND
