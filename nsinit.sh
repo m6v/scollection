@@ -12,40 +12,44 @@ pivot_root "$MERGED_DIR" "$MERGED_DIR/old_root"
 cd /
 mount --make-rprivate /
 
-# Проброс графических сокетов хоста
-if [ "$IS_GUI_ENABLED" = true ]; then
-    mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
-fi
-
-# Проброс пользовательских каталогов
-if [ -n "$VOLUME_MAP" ]; then
-    mkdir -p "$GUEST_PATH"
-    mount --bind "/old_root/$HOST_PATH" "$GUEST_PATH"
-fi
-
-# Монтирование виртуальных системных ФС ядра
+# Монтирование ФС ядра
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devpts devpts /dev/pts
 mount -t tmpfs tmpfs /run
 
-# Расмонтирование старого кореня хоста и поднятие локальной петли
+# Проброс графических сокетов хоста
+if [ "$IS_GUI_ENABLED" = true ]; then
+    mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
+fi
+
+# Проброс пользовательских каталогов (Volumes)
+if [ -n "$VOLUME_MAP" ]; then
+    mkdir -p "$GUEST_PATH"
+    mount --bind "/old_root/$HOST_PATH" "$GUEST_PATH"
+fi
+
+# Расмонтирование старого корня хоста и поднятие локальной петли
 umount -l /old_root
 ip link set lo up
 
 if [ "$IS_NET_ENABLED" = true ]; then
     echo "Активация сетевого интерфейса контейнера..."
     
-    # Включить проброшенный в контейнер veth-кабель
+    # включаем проброшенный виртуальный кабель
     ip link set veth-guest up
     
-    # Присвоить интерфейсу veth-guest IP-адрес 
-    ip addr add "$GUEST_IP/24" dev veth-guest
+    # фолбэк для маски подсети (если переменная пуста, откатываемся на /24)
+    [ -z "$bridge_mask" ] && bridge_mask="24"
+
+    # ДИНАМИЧЕСКАЯ МАСКА: присваиваем ip-адрес с актуальной маской хоста
+    ip addr add "$GUEST_IP/$bridge_mask" dev veth-guest
     
-    # Маршрут по умолчанию
-    ip route add default via 10.0.0.1
+    # ДИНАМИЧЕСКИЙ ШЛЮЗ: прописываем маршрут по умолчанию через переданный ip моста
+    [ -z "$bridge_ip" ] && bridge_ip="10.0.0.1"
+    ip route add default via "$bridge_ip"
     
-    echo "Сетевой стек контейнера активирован, IP: $GUEST_IP"
+    echo "Сетевой стек контейнера успешно активирован, IP: $GUEST_IP/$bridge_mask"
 fi
 
 # Если COMMAND не определена запускать bash

@@ -50,6 +50,9 @@ NET_NS_FILE="/var/run/netns/$NET_NAME"
 
 # Определение сетевой карты хоста с доступом в интернет
 HOST_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+# Адрес виртуального моста
+BRIDGE_CIDR="10.0.0.1/24"
+
 IS_NET_ENABLED=false
 IS_GUI_ENABLED=false
 
@@ -82,13 +85,13 @@ while [ $# -gt 0 ]; do
             ;;
         -n|--net)
             IS_NET_ENABLED=true
-            # Если аргумент $2 пустой, ИЛИ начинается с дефиса, 
-            # ИЛИ если аргумент $2 — это последний оставшийся аргумент строки ($# -eq 2),
+            # Если аргумент $2 пустой или начинается с дефиса, 
+            # или если аргумент $2 — это последний оставшийся аргумент строки ($# -eq 2),
             # значит пользователь не передавал IP, а сразу написал имя контейнера!
             if [[ -z "$2" ]] || [[ "$2" =~ ^- ]] || [ "$#" -eq 2 ]; then
-                GUEST_IP="auto"
+                GUEST_IP=""
                 shift 1
-            # Если это не имя контейнера и не флаг, проверяем строгий формат IP
+            # Если это не имя контейнера и не флаг, проверяем формат IP
             elif [[ "$2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                 GUEST_IP="$2"
                 shift 2
@@ -281,45 +284,89 @@ fi
 
 # Настройка сетевого пространства на хосте
 if [ "$IS_NET_ENABLED" = true ]; then
-    if [ "$GUEST_IP" = "10.0.0.1" ]; then
+    # ip-адреса и маска шлюза
+    export bridge_ip="${BRIDGE_CIDR%/*}"
+    export bridge_mask="${BRIDGE_CIDR#*/}"
+
+    if [ "$GUEST_IP" = "$bridge_ip" ]; then
         echo "Ошибка: Адрес $GUEST_IP занят виртуальным мостом хоста (шлюзом)."
         exit 1
     fi
 
     echo "Настройка сети через виртуальный мост $BRIDGE_NAME..."
-    if [ -e "$NET_NS_FILE" ]; then ip netns delete "$NET_NAME"; fi
+    
+    nft delete table ip nsbox_nat 2>/dev/null || true
 
     if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
         ip link add "$BRIDGE_NAME" type bridge
-        ip addr add 10.0.0.1/24 dev "$BRIDGE_NAME"
+        # ИСПРАВЛЕНО: добавлен знак доллара для корректной подстановки значения константы
+        ip addr add "$BRIDGE_CIDR" dev "$BRIDGE_NAME"
         ip link set "$BRIDGE_NAME" up
-
-        sysctl -w net.ipv4.ip_forward=1 > /dev/null
-        nft add table ip nsbox_nat 2>/dev/null || true
-        nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
-        nft add rule ip nsbox_nat postrouting oifname "$HOST_IFACE" ip saddr 10.0.0.0/24 masquerade 2>/dev/null || true
     fi
 
-    if [ "$GUEST_IP" = "auto" ]; then
-        # Если включен авторежим, циклом от .2 до .254 и ищем первый свободный IP
-        for i in {2..254}; do
-            # Проверяем, не выдан ли уже этот IP какому-то активному сетевому пространству имен
-            if ! ip netns exec "$NET_NAME" ip addr show 2>/dev/null | grep -q "10.0.0.$i/"; then
-                # Проверяем, нет ли его в ARP-таблице соседей нашего моста
-                if ! ip neighbor show dev "$BRIDGE_NAME" | grep -q "10.0.0.$i "; then
-                    GUEST_IP="10.0.0.$i"
-                    break
-                fi
+    sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    
+    # Инициализируем таблицу и базовую цепочку
+    nft add table ip nsbox_nat 2>/dev/null || true
+    nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+    
+    # Побитовый расчет системной маски подсети (например, 24 бита -> 255.255.255.0)
+    mask_num=$(( 0xFFFFFFFF << (32 - bridge_mask) ))
+    
+    # Перевод ip шлюза в плоское число для битовой математики
+    IFS=. read -r i1 i2 i3 i4 <<< "$bridge_ip"
+    bridge_num=$(( (i1 << 24) + (i2 << 16) + (i3 << 8) + i4 ))
+    
+    # Вычисление базового адреса сети и широковещательного адреса (broadcast)
+    network_num=$(( bridge_num & mask_num ))
+    broadcast_num=$(( network_num | (~mask_num & 0xFFFFFFFF) ))
+    
+    # Конвертация плоского числа обратно в каноничный ip-адрес сети (например, 10.0.0.0)
+    net_addr="$(( (network_num >> 24) & 255 )).$(( (network_num >> 16) & 255 )).$(( (network_num >> 8) & 255 )).$(( network_num & 255 ))"
+
+    # Маскарадинг подсети на основе вычисленного сетевого адреса
+    nft add rule ip nsbox_nat postrouting ip saddr "$net_addr/$bridge_mask" masquerade 2>/dev/null || true
+
+    # Автовыбор IP-адреса для контейнера
+    if [ -z "$GUEST_IP" ]; then
+        # Определение первого и последнего доступного ip-хоста в подсети
+        start_num=$(( network_num + 1 ))
+        end_num=$(( broadcast_num - 1 ))
+
+        # Сбор занятых ipv4-адресов подсети, фильтр master ограничивает опрос только интерфейсами виртуального моста
+        busy_ips=$( { ip addr show master "$BRIDGE_NAME"; ip neighbor show dev "$BRIDGE_NAME"; } 2>/dev/null | grep -oE "[0-9.]+" | tr '\n' ' ' )
+        
+        # Добавление ip-адреса виртуального моста в список занятых адресов
+        busy_ips="$busy_ips $bridge_ip"
+
+        # Перебор адресов внутри диапазона подсети
+        GUEST_IP=""
+        for ((num=start_num; num<=end_num; num++)); do
+            # Обратная конвертация десятичного числа в каноничный ip-адрес формата x.x.x.x
+            test_ip="$(( (num >> 24) & 255 )).$(( (num >> 16) & 255 )).$(( (num >> 8) & 255 )).$(( num & 255 ))"
+            
+            # Проверка отсутствия совпадения в строке занятых адресов
+            if [[ " $busy_ips " != *" $test_ip "* ]]; then
+                GUEST_IP="$test_ip"
+                break
             fi
         done
-        # Если цикл завершился, а переменная осталась пустой — сеть переполненна
+
         if [ -z "$GUEST_IP" ]; then
-            echo "Ошибка: Не удалось автоматически выделить IP-адрес. В подсети 10.0.0.0/24 не осталось свободных адресов!"
+            echo "Ошибка: Не удалось автоматически выделить IP-адрес. В подсети $BRIDGE_CIDR не осталось свободных адресов!"
             exit 1
         fi
     fi
     echo "Контейнеру выделен IP-адрес $GUEST_IP"
 
+    # Если файл дескриптора netns застрял в памяти — принудительно удаляем его перед стартом
+    if [ -e "/run/netns/$NET_NAME" ]; then
+        umount -l "/run/netns/$NET_NAME" 2>/dev/null || true
+        rm -f "/run/netns/$NET_NAME" 2>/dev/null || true
+        ip netns delete "$NET_NAME" 2>/dev/null || true
+    fi
+
+    # Создание пространства $NET_NAME и виртуального кабеля $VETH_HOST <-> "$VETH_GUEST"
     ip netns add "$NET_NAME"
     ip link add "$VETH_HOST" type veth peer name "$VETH_GUEST" netns "$NET_NAME"
 
@@ -331,29 +378,31 @@ else
     echo "" > "$MERGED_DIR/etc/resolv.conf"
 fi
 
+# Настройка проброса портов
 if [ -n "$PORT_MAP" ]; then
-    # Разрезаем порты по двоеточию
-    HOST_PORT=$(echo "$PORT_MAP" | cut -d':' -f1)
-    GUEST_PORT=$(echo "$PORT_MAP" | cut -d':' -f2)
+    # Извлечение номеров порта хоста и порта контейнера
+    HOST_PORT="${PORT_MAP%%:*}"
+    GUEST_PORT="${PORT_MAP#*:}"
 
+    # Вывод информационного сообщения об инициализации трансляции портов
     echo "Активация проброса порта: хост $HOST_PORT -> контейнер $GUEST_IP:$GUEST_PORT..."
 
-    # Принудительно разрешаем на хосте перенаправление локального трафика (127.0.0.1) в сеть виртуального моста
-    sysctl -w net.ipv4.conf.all.route_localnet=1 > /dev/null
-    sysctl -w net.ipv4.conf."$BRIDGE_NAME".route_localnet=1 > /dev/null
-    # Очистка старых цепочек NAT
-    nft flush table ip nsbox_nat 2>/dev/null || true
-    # Добавление цепочки prerouting (для пакетов из внешнего мира)
+    # Атомарное создание таблицы маршрутизации ip-пакетов с именем nsbox_nat
+    nft add table ip nsbox_nat 2>/dev/null || true
+    
+    # Создание цепочки предварительной маршрутизации для входящего сетевого трафика
     nft add chain ip nsbox_nat prerouting { type nat hook prerouting priority -100 \; } 2>/dev/null || true
-    # Выполнение DNAT только для пакетов поступивших извне на реальную сетевую карту хоста,
-    # при этом трафик внутри моста 10.0.0.X это правило игнорирует
-    nft add rule ip nsbox_nat prerouting iifname "$HOST_IFACE" tcp dport "$HOST_PORT" dnat to "$GUEST_IP:$GUEST_PORT" 2>/dev/null || true
-    # Добавление цепочки output (для пакетов, рожденных на самом хосте через localhost)
+    # dnat для входящих пакетов из внешних интерфейсов (исключая сетевой мост)
+    nft add rule ip nsbox_nat prerouting iifname != "$BRIDGE_NAME" tcp dport "$HOST_PORT" dnat to "$GUEST_IP:$GUEST_PORT" 2>/dev/null || true
+
+    # Создание цепочки маршрутизации для исходящего трафика, генерируемого самим хостом
     nft add chain ip nsbox_nat output { type nat hook output priority -100 \; } 2>/dev/null || true
-    # Выполнение локального DNAT только если вы явно стучитесь на 127.0.0.1 (интерфейс lo)!
-    nft add rule ip nsbox_nat output oifname "lo" tcp dport "$HOST_PORT" dnat to "$GUEST_IP:$GUEST_PORT" 2>/dev/null || true
-    # Маскарадинг (SNAT) для обратного пути
+    # dnat для локальных пакетов хоста, адресованных строго на ip-адрес шлюза моста
+    nft add rule ip nsbox_nat output ip daddr 10.0.0.1 tcp dport "$HOST_PORT" dnat to "$GUEST_IP:$GUEST_PORT" 2>/dev/null || true
+
+    # Создание цепочки пост-маршрутизации для изменения сетевых адресов перед отправкой пакета
     nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+    # Ммаскарадинг источника для корректного возврата ответов от контейнера к хосту
     nft add rule ip nsbox_nat postrouting ip daddr "$GUEST_IP" tcp dport "$GUEST_PORT" masquerade 2>/dev/null || true
 fi
 
