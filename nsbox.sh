@@ -42,16 +42,18 @@ LOWER_DIR="/"
 
 VOLUME_MAP=""
 
+# Имя и адрес виртуального моста
 BRIDGE_NAME="nsboxbr"
+BRIDGE_CIDR="10.0.0.1/24"
+
+# Концы виртуального кабеля
 VETH_HOST="veth-$$"
 VETH_GUEST="veth-guest"
-NET_NAME="container_net"
+NET_NAME="nsbox-net"
 NET_NS_FILE="/var/run/netns/$NET_NAME"
 
 # Определение сетевой карты хоста с доступом в интернет
 HOST_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-# Адрес виртуального моста
-BRIDGE_CIDR="10.0.0.1/24"
 
 IS_NET_ENABLED=false
 IS_GUI_ENABLED=false
@@ -83,23 +85,28 @@ while [ $# -gt 0 ]; do
                 echo "Ошибка: Флаг --lower требует указания пути к каталогу."; exit 1
             fi
             ;;
-        -n|--net)
-            IS_NET_ENABLED=true
-            # Если аргумент $2 пустой или начинается с дефиса, 
-            # или если аргумент $2 — это последний оставшийся аргумент строки ($# -eq 2),
-            # значит пользователь не передавал IP, а сразу написал имя контейнера!
-            if [[ -z "$2" ]] || [[ "$2" =~ ^- ]] || [ "$#" -eq 2 ]; then
-                GUEST_IP=""
-                shift 1
-            # Если это не имя контейнера и не флаг, проверяем формат IP
-            elif [[ "$2" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                GUEST_IP="$2"
-                shift 2
-            else
-                echo "Ошибка: Неверный формат IP-адреса для флага --net: '$2'"
-                echo "Используйте валидный IP (например, --net 10.0.0.5) или напишите просто --net для автовыбора."
+        --net)
+            # извлечение значения параметра сети, идущего следующим аргументом
+            GUEST_IP="$2"
+            
+            # регулярное выражение для строгой проверки каноничного формата ipv4
+            ipv4_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+
+            # проверка на пустоту значения или попытку подставить следующий флаг запуска вместо адреса
+            if [ -z "$GUEST_IP" ] || [[ "$GUEST_IP" == -* ]]; then
+                echo "Ошибка: Флаг --net требует обязательного значения (IP-адрес или 'auto')!"
                 exit 1
             fi
+
+            # проверка соответствия значения разрешенным параметрам auto или валидному ip
+            if [ "$GUEST_IP" != "auto" ] && [[ ! "$GUEST_IP" =~ $ipv4_regex ]]; then
+                echo "Ошибка: Некорректное значение флага --net. Допускается только IP-адрес или 'auto'!"
+                exit 1
+            fi
+
+            # активация сетевого флага проекта при успешном прохождении валидации
+            IS_NET_ENABLED=true
+            shift 2
             ;;
         -p|--port)
             if [ -n "$2" ]; then
@@ -284,7 +291,7 @@ fi
 
 # Настройка сетевого пространства на хосте
 if [ "$IS_NET_ENABLED" = true ]; then
-    # ip-адреса и маска шлюза
+    # Определение и экспорт ip-адреса и маски шлюза
     export bridge_ip="${BRIDGE_CIDR%/*}"
     export bridge_mask="${BRIDGE_CIDR#*/}"
 
@@ -299,7 +306,6 @@ if [ "$IS_NET_ENABLED" = true ]; then
 
     if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
         ip link add "$BRIDGE_NAME" type bridge
-        # ИСПРАВЛЕНО: добавлен знак доллара для корректной подстановки значения константы
         ip addr add "$BRIDGE_CIDR" dev "$BRIDGE_NAME"
         ip link set "$BRIDGE_NAME" up
     fi
@@ -310,42 +316,35 @@ if [ "$IS_NET_ENABLED" = true ]; then
     nft add table ip nsbox_nat 2>/dev/null || true
     nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
     
-    # Побитовый расчет системной маски подсети (например, 24 бита -> 255.255.255.0)
+    # Автоматический расчет адреса сети для маскарадинга
     mask_num=$(( 0xFFFFFFFF << (32 - bridge_mask) ))
     
-    # Перевод ip шлюза в плоское число для битовой математики
     IFS=. read -r i1 i2 i3 i4 <<< "$bridge_ip"
     bridge_num=$(( (i1 << 24) + (i2 << 16) + (i3 << 8) + i4 ))
     
-    # Вычисление базового адреса сети и широковещательного адреса (broadcast)
     network_num=$(( bridge_num & mask_num ))
     broadcast_num=$(( network_num | (~mask_num & 0xFFFFFFFF) ))
     
-    # Конвертация плоского числа обратно в каноничный ip-адрес сети (например, 10.0.0.0)
     net_addr="$(( (network_num >> 24) & 255 )).$(( (network_num >> 16) & 255 )).$(( (network_num >> 8) & 255 )).$(( network_num & 255 ))"
 
     # Маскарадинг подсети на основе вычисленного сетевого адреса
     nft add rule ip nsbox_nat postrouting ip saddr "$net_addr/$bridge_mask" masquerade 2>/dev/null || true
 
-    # Автовыбор IP-адреса для контейнера
-    if [ -z "$GUEST_IP" ]; then
+    # Автовыбор IP-адреса для контейнера, если GUEST_IP равен 'auto'
+    if [ "$GUEST_IP" = "auto" ]; then
         # Определение первого и последнего доступного ip-хоста в подсети
         start_num=$(( network_num + 1 ))
         end_num=$(( broadcast_num - 1 ))
 
-        # Сбор занятых ipv4-адресов подсети, фильтр master ограничивает опрос только интерфейсами виртуального моста
-        busy_ips=$( { ip addr show master "$BRIDGE_NAME"; ip neighbor show dev "$BRIDGE_NAME"; } 2>/dev/null | grep -oE "[0-9.]+" | tr '\n' ' ' )
-        
-        # Добавление ip-адреса виртуального моста в список занятых адресов
+        # Сбор занятых ipv4-адресов подсети
+        busy_ips=$( { ip addr show master "$BRIDGE_NAME"; ip neighbor show dev "$BRIDGE_NAME"; } 2>/dev/null | grep -oE "${bridge_ip%.*}\.[0-9]+" | tr '\n' ' ' )
         busy_ips="$busy_ips $bridge_ip"
 
-        # Перебор адресов внутри диапазона подсети
+        # Перебор хостов внутри диапазона подсети
         GUEST_IP=""
         for ((num=start_num; num<=end_num; num++)); do
-            # Обратная конвертация десятичного числа в каноничный ip-адрес формата x.x.x.x
             test_ip="$(( (num >> 24) & 255 )).$(( (num >> 16) & 255 )).$(( (num >> 8) & 255 )).$(( num & 255 ))"
             
-            # Проверка отсутствия совпадения в строке занятых адресов
             if [[ " $busy_ips " != *" $test_ip "* ]]; then
                 GUEST_IP="$test_ip"
                 break
@@ -411,12 +410,14 @@ if [ "$IS_GUI_ENABLED" = true ]; then
     echo "Подготовка безопасной инфраструктуры X11..."
     mkdir -p "$MERGED_DIR/tmp/.X11-unix"
 
-    # Если на хосте используется Wayland
     if [ -d "$XDG_RUNTIME_DIR" ]; then
+        # Создание целевой папки внутри оверлея контейнера
         mkdir -p "$MERGED_DIR$XDG_RUNTIME_DIR"
+        # Монтирование папки сокетов хоста в изолированный корень контейнера
+        mount --bind "$XDG_RUNTIME_DIR" "$MERGED_DIR$XDG_RUNTIME_DIR"
     fi
-
-    # Копируем файл авторизации .Xauthority в виртуальное окно merged
+    
+    # Копирование файла авторизации .Xauthority в виртуальное окно merged
     if [ -n "$REAL_XAUTH" ] && [ -f "$REAL_XAUTH" ]; then
         mkdir -p "$MERGED_DIR/root"
         cp -L "$REAL_XAUTH" "$MERGED_DIR/root/.Xauthority" 2>/dev/null || true
@@ -435,7 +436,7 @@ if [ -n "$VOLUME_MAP" ]; then
         mkdir -p "$HOST_PATH"
     fi
     
-    # Создаем целевую точку монтирования в оверлее, чтобы ядру было куда крепить диск
+    # Создание целевой точки монтирования в оверлее, чтобы ядру было куда крепить диск
     mkdir -p "$MERGED_DIR$GUEST_PATH"
 fi
 
@@ -458,11 +459,11 @@ if [ -n "$VETH_HOST" ] && [ -d "/sys/class/net/$VETH_HOST" ]; then
     ip link delete "$VETH_HOST" 2>/dev/null || true
 fi
 
-# Зачищаем пространство имен
+# Зачистка пространства имен
 if [ -e "$NET_NS_FILE" ]; then
-    # Лениво отмонтируем файл-маркер, разрывая любые зависшие мертвые связи с unshare
+    # Ленивое отмонтирование файл-маркера
     umount -l "$NET_NS_FILE" 2>/dev/null || true
-    # Удаляем пространство из системы
+    # Удаление пространство из системы
     ip netns delete "$NET_NAME" 2>/dev/null || true
 fi
 
