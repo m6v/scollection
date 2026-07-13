@@ -10,6 +10,9 @@ if [ "$EUID" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
 
+# Получение ключа авторизации X11 из параметров запущенного графического сервера хоста
+REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' | head -n 1 | cut -d' ' -f2)
+
 usage() {
     echo "Использование: $0 [ОПЦИИ] имя_контейнера"
     echo ""
@@ -181,9 +184,6 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-# По умолчанию запускаем bash
-COMMAND="${COMMAND:-bash}"
-
 # Динамическое формирование сетевого префикса
 if [ "$IS_NET_ENABLED" = true ]; then
     # Подключение готовой сети хоста
@@ -199,7 +199,7 @@ if [ -z "$GUEST_NAME" ]; then
     usage
 fi
 
-if echo "$GUEST_NAME" | grep -q "/"; then
+if [[ "$GUEST_NAME" == *"/"* ]]; then
     echo "Ошибка: Задано недопустимое имя контейнера '$GUEST_NAME'."
     echo "Имя должно быть простым идентификатором без слэшей."
     exit 1
@@ -363,32 +363,29 @@ if [ "$IS_GUI_ENABLED" = true ]; then
     mkdir -p "$MERGED_DIR/tmp/.X11-unix"
 
     # Если на хосте используется Wayland
-    if [ -n "$WAYLAND_DISPLAY" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+    if [ -d "$XDG_RUNTIME_DIR" ]; then
         mkdir -p "$MERGED_DIR$XDG_RUNTIME_DIR"
     fi
 
-    # Получение ключа авторизации X11 из параметров запущенного графического сервера хоста
-    REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' | head -n 1 | cut -d' ' -f2)
-
-    # Если ключ авторизации X11 обнаружен — копируем его в контейнер
+    # Копируем файл авторизации .Xauthority в виртуальное окно merged
     if [ -n "$REAL_XAUTH" ] && [ -f "$REAL_XAUTH" ]; then
         mkdir -p "$MERGED_DIR/root"
         cp -L "$REAL_XAUTH" "$MERGED_DIR/root/.Xauthority" 2>/dev/null || true
         echo "Ключ авторизации X11 $REAL_XAUTH успешно импортирован."
     else
-        echo "Предупреждение: Активный файл авторизации X11 не обнаружен."
+        echo "Предупреждение: Активный файл авторизации X11 не обнаружен по пути: '$REAL_XAUTH'"
     fi
-        
-    # Закрываем шлюз хоста
-    xhost -local: >/dev/null 2>&1 || true
 fi
 
 # Подготовка путей для проброса каталога в контейнер
 if [ -n "$VOLUME_MAP" ]; then
+    # Если каталога на хосте не существует — автоматически создаем его, 
+    # чтобы не ломать запуск контейнера из-за отсутствующих пустых папок
     if [ ! -d "$HOST_PATH" ]; then
-        echo "Ошибка: Каталог на хосте '$HOST_PATH' не существует."
-        exit 1
+        echo "Предупреждение: Каталог '$HOST_PATH' на хосте не найден. Создаю автоматически..."
+        mkdir -p "$HOST_PATH"
     fi
+    
     # Создаем целевую точку монтирования в оверлее, чтобы ядру было куда крепить диск
     mkdir -p "$MERGED_DIR$GUEST_PATH"
 fi
@@ -402,31 +399,26 @@ if [ -n "$VOLUME_MAP" ] && [ -d "$UPPER_DIR$GUEST_PATH" ]; then
 fi
 
 echo "Размонтирование дисков хоста..."
-if mountpoint -q "$MERGED_DIR"; then umount -l "$MERGED_DIR"; fi
-if mountpoint -q "$ROOT_DIR"; then umount -l "$ROOT_DIR"; fi
-if mountpoint -q "$BASE_DIR"; then umount -l "$BASE_DIR" ; fi
+umount -l "$MERGED_DIR" 2>/dev/null || true
+umount -l "$ROOT_DIR"   2>/dev/null || true
+umount -l "$BASE_DIR"   2>/dev/null || true
 
-if [ "$IS_NET_ENABLED" = true ]; then
-    echo "Очистка сетевых ресурсов хоста..."
-
-    # Гасим и удаляем виртуальный кабель хоста VETH_HOST, при этом
-    # ядро автоматически уничтожает гостевой конец veth-GUEST внутри контейнера
-    if ip link show "$VETH_HOST" >/dev/null 2>&1; then
-        ip link set dev "$VETH_HOST" down 2>/dev/null || true
-        ip link delete "$VETH_HOST" 2>/dev/null || true
-    fi
-
-    # Зачищаем пространство имен
-    if [ -e "$NET_NS_FILE" ]; then
-        # Лениво отмонтируем файл-маркер, разрывая любые зависшие мертвые связи с unshare
-        umount -l "$NET_NS_FILE" 2>/dev/null || true
-        
-        # Бесшумно и чисто удаляем пространство из системы
-        ip netns delete "$NET_NAME" 2>/dev/null || true
-    fi
+echo "Очистка сетевых ресурсов хоста..."
+if [ -n "$VETH_HOST" ] && [ -d "/sys/class/net/$VETH_HOST" ]; then
+    ip link set dev "$VETH_HOST" down 2>/dev/null || true
+    ip link delete "$VETH_HOST" 2>/dev/null || true
 fi
 
-# Удаление созданной группы cgroups v2, если была создана хотя бы одна настройка
-if { [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; } && [ -d "$CGROUP_PATH" ]; then
+# Зачищаем пространство имен
+if [ -e "$NET_NS_FILE" ]; then
+    # Лениво отмонтируем файл-маркер, разрывая любые зависшие мертвые связи с unshare
+    umount -l "$NET_NS_FILE" 2>/dev/null || true
+    # Удаляем пространство из системы
+    ip netns delete "$NET_NAME" 2>/dev/null || true
+fi
+
+# Удаление созданной cgroups, если была создана
+if [ -d "$CGROUP_PATH" ]; then
+    echo "Удаление контрольной группы cgroups контейнера..."
     rmdir "$CGROUP_PATH" 2>/dev/null || true
 fi
