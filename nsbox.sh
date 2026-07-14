@@ -421,25 +421,9 @@ if [ "$IS_GUI_ENABLED" = true ]; then
         mount --bind "$XDG_RUNTIME_DIR" "$MERGED_DIR$XDG_RUNTIME_DIR"
     fi
     
-    # Копирование файла авторизации .Xauthority в виртуальное окно merged
     if [ -n "$REAL_XAUTH" ] && [ -f "$REAL_XAUTH" ]; then
-        mkdir -p "$MERGED_DIR/root"
-
-        # NB! Следующий блок кода по созданию .Xauthority это "хакерское" решение,
-        # 
-        # Удаление старого файла, если он остался от прошлых запусков
-        rm -f "$MERGED_DIR/root/.Xauthority"
-        # Извлечение ключа хоста, подмена семейства адресов на ffff (wildcard)
-        # и сохранение файла в изолированную merged-директорию контейнера
-        xauth -f "$REAL_XAUTH" nlist "$DISPLAY" 2>/dev/null | sed -e 's/^..../ffff/' | xauth -f "$MERGED_DIR/root/.Xauthority" nmerge - 2>/dev/null || true
-        # Принудительная синхронизация кэша файловой системы
-        sync "$MERGED_DIR/root/.Xauthority"
-
-
-        # cp -L "$REAL_XAUTH" "$MERGED_DIR/root/.Xauthority" 2>/dev/null || true
-        # echo "Ключ авторизации X11 $REAL_XAUTH успешно импортирован."
-    else
-        echo "Предупреждение: Активный файл авторизации X11 не обнаружен по пути: '$REAL_XAUTH'"
+        # Извлечение 32-символьного hex-ключа (MIT-MAGIC-COOKIE) текущего дисплея хоста
+        export XBOX_HEX_COOKIE=$(xauth -f "$REAL_XAUTH" list "$DISPLAY" 2>/dev/null | awk '{print $NF}')
     fi
 fi
 

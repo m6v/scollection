@@ -23,16 +23,28 @@ mount -t tmpfs tmpfs /run
 hostname "$CONTAINER_NAME"
 echo "127.0.0.1 localhost $CONTAINER_NAME" > /etc/hosts
 
-# Проброс графических сокетов хоста
-if [ "$IS_GUI_ENABLED" = true ]; then
-    # стандартный проброс сокетов X11
-    mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
-fi
-
 # Проброс пользовательских каталогов (Volumes)
 if [ -n "$VOLUME_MAP" ]; then
     mkdir -p "$GUEST_PATH"
     mount --bind "/old_root/$HOST_PATH" "$GUEST_PATH"
+fi
+
+if [ "$IS_GUI_ENABLED" = true ]; then
+    # Сквозной проброс unix-сокета дисплея из старого корня хоста
+    if [ -d /old_root/tmp/.X11-unix ]; then
+        mkdir -p /tmp/.X11-unix
+        mount --bind /old_root/tmp/.X11-unix /tmp/.X11-unix
+    fi
+
+    # Генерация бинарных мандатов аторизации
+    if [ -n "$XBOX_HEX_COOKIE" ]; then
+        # Обнуление файла авторизации сессии X11
+        > /root/.Xauthority
+        # Привязка секретной куки хоста ко всем легитимным сокетам и адресам контейнера
+        xauth -f /root/.Xauthority add "$CONTAINER_NAME/unix$DISPLAY" MIT-MAGIC-COOKIE-1 "$XBOX_HEX_COOKIE" 2>/dev/null || true
+        xauth -f /root/.Xauthority add "localhost$DISPLAY" MIT-MAGIC-COOKIE-1 "$XBOX_HEX_COOKIE" 2>/dev/null || true
+        xauth -f /root/.Xauthority add "127.0.0.1$DISPLAY" MIT-MAGIC-COOKIE-1 "$XBOX_HEX_COOKIE" 2>/dev/null || true
+    fi
 fi
 
 # Размонтирование старого корня хоста
@@ -62,9 +74,6 @@ fi
 
 # Запуск bash, если COMMAND не определена
 COMMAND="${COMMAND:-bash}"
-
-echo "DISPLAY: $DISPLAY"
-[ -z "$DISPLAY" ] && DISPLAY=":0"
 
 # Стерилизация переменных окружения (env -i) и запуск $COMMAND
 exec env -i bash -c "
