@@ -29,6 +29,9 @@ if [ -n "$VOLUME_MAP" ]; then
     mount --bind "/old_root/$HOST_PATH" "$GUEST_PATH"
 fi
 
+# Защита от ослепления утилитой sudo хоста
+[ -z "$DISPLAY" ] && DISPLAY=":0.0"
+
 if [ "$IS_GUI_ENABLED" = true ]; then
     # Сквозной проброс unix-сокета дисплея из старого корня хоста
     if [ -d /old_root/tmp/.X11-unix ]; then
