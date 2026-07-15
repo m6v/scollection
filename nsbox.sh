@@ -14,7 +14,7 @@ cat << EOF
 Аргументы, обязательные для длинных параметров, обязательны и для коротких.
   -c, --command 'программа'     Запустить программу в изолированном контейнере
   -g, --gui                     Настроить запуск графических программ внутри контейнера
-  -l, --lower 'путь'            Указать каталог для нижнего слоя ФС контейнера, по умолчанию корень ФС хоста
+  -r, --root 'путь'             Указать корневой каталог ФС контейнера, по умолчанию корень ФС хоста
   -n, --net 'auto | IP-адрес'   Использовать виртуальный адаптер, например, -n 10.0.0.5
   -p, --port 'хост:контейнер'   Настроить трансляцию портов, например, -p 8080:80
   -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера
@@ -37,9 +37,9 @@ REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' 
 MAX_SIZE="16G"
 
 # Контейненронезависимые каталоги
-REGISTRY_DIR="/var/lib/nsbox"
-RUNTIME_DIR="$REGISTRY_DIR/run"  # Runtime-пространство контейнеров
-ROOT_DIR="$RUNTIME_DIR/root"     # Каталог для монтирования нижнего слоя ФС контейнера
+STORAGE_DIR="/var/lib/nsbox"
+RUNTIME_DIR="/run/nsbox"
+mkdir -p "$STORAGE_DIR" "$RUNTIME_DIR"
 
 # Имя и адрес виртуального моста
 BRIDGE_NAME="nsboxbr"
@@ -48,9 +48,6 @@ BRIDGE_CIDR="10.0.0.1/24"
 # Концы виртуального кабеля
 VETH_HOST="veth-$$"
 VETH_GUEST="veth-guest"
-
-NET_NAME="nsbox-net"
-NET_NS_FILE="/var/run/netns/$NET_NAME"
 
 # Определение сетевой карты хоста с доступом в интернет
 HOST_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
@@ -73,16 +70,16 @@ while [ $# -gt 0 ]; do
                 usage
             fi
             ;;
-        -l|--lower)
+        -r|--root)
             if [ -n "$2" ]; then
                 if [ ! -d "$2" ]; then
-                    echo "Ошибка: Каталог нижнего слоя '$2' не найден на хосте!"
+                    echo "Ошибка: Корневой каталог '$2' не найден на хосте!"
                     exit 1
                 fi
-                LOWER_DIR=$(realpath "$2")
+                ROOT_DIR=$(realpath "$2")
                 shift 2
             else
-                echo "Ошибка: Параметр --lower требует указания пути к каталогу."; exit 1
+                echo "Ошибка: Параметр --root требует указания пути к каталогу."; exit 1
             fi
             ;;
         -n|--net)
@@ -196,13 +193,16 @@ done
 
 if [ -z "$CONTAINER_NAME" ]; then
     echo -n "Ошибка: Не указано имя контейнера. "
-    existed_containers=$(find "$REGISTRY_DIR" -type f -name *.img -print0 | xargs -0 -n 1 basename -s .img 2>/dev/null | tr '\n' ' ')
+    existed_containers=$(find "$STORAGE_DIR" -type f -name *.img -print0 | xargs -0 -n 1 basename -s .img 2>/dev/null | tr '\n' ' ')
     if [ -n "$existed_containers" ]; then
         echo -n "Укажите новый или один из существующих: $existed_containers"
     fi
     echo -e "\n"
     usage
 fi
+
+NET_NAME="$CONTAINER_NAME"
+NET_NS_FILE="/var/run/netns/$NET_NAME"
 
 # Динамическое формирование сетевого префикса
 if [ "$IS_NET_ENABLED" = true ]; then
@@ -221,17 +221,7 @@ if [[ ! "$CONTAINER_NAME" =~ $hostname_regex ]]; then
     exit 1
 fi
 
-# Монтирование нижнего слоя OverlayFS
-: "${LOWER_DIR:="/"}"
-mkdir -p "$ROOT_DIR"
-if ! mountpoint -q "$ROOT_DIR"; then mount --bind "$LOWER_DIR" "$ROOT_DIR"; fi
-
-IMAGE_FILE="$REGISTRY_DIR/$CONTAINER_NAME.img"
-# Контейнерозависимые каталоги
-BASE_DIR="$REGISTRY_DIR/$CONTAINER_NAME"
-MERGED_DIR="$RUNTIME_DIR/$CONTAINER_NAME"
-mkdir -p "$BASE_DIR" "$MERGED_DIR"
-
+IMAGE_FILE="$STORAGE_DIR/$CONTAINER_NAME.img"
 # Создание виртуального жесткого диска (в разреженном файле)
 if [ ! -f "$IMAGE_FILE" ]; then
     echo "Создание разреженного $IMAGE_FILE с максимальным размером $MAX_SIZE..."
@@ -240,17 +230,34 @@ if [ ! -f "$IMAGE_FILE" ]; then
     mkfs.ext4 -F "$IMAGE_FILE"
 fi
 
-# Монтирование виртуального диска
+# Монтирование нижнего слоя OverlayFS
+: "${ROOT_DIR:="/"}"
+# Каталог для монтирования нижнего слоя ФС контейнера
+LOWER_DIR="$RUNTIME_DIR/root"
+mkdir -p "$LOWER_DIR"
+if ! mountpoint -q "$LOWER_DIR"; then
+    mount --bind "$ROOT_DIR" "$LOWER_DIR";
+fi
+
+# Контейнерозависимые каталоги
+BASE_DIR="$STORAGE_DIR/$CONTAINER_NAME"
+MERGED_DIR="$RUNTIME_DIR/$CONTAINER_NAME/merged"
+mkdir -p "$BASE_DIR" "$MERGED_DIR"
+
+# Монтирование виртуального диска для upperdir и workdir
 if ! mountpoint -q "$BASE_DIR"; then
     mount -o loop,user_xattr "$IMAGE_FILE" "$BASE_DIR"
 fi
 
+# Создание каталогов для upperdir и workdir, которые обязаны быть в одной точке монтирования,
+# но не могут быть вложенными один в другой!
 UPPER_DIR="$BASE_DIR/upper"
 WORK_DIR="$BASE_DIR/work"
 mkdir -p "$UPPER_DIR" "$WORK_DIR"
+
 # Сборка OverlayFS в MERGED_DIR
 if ! mountpoint -q "$MERGED_DIR"; then
-    mount -t overlay overlay -o lowerdir="$ROOT_DIR",upperdir="$UPPER_DIR",workdir="$WORK_DIR" "$MERGED_DIR"
+    mount -t overlay overlay -o lowerdir="$LOWER_DIR",upperdir="$UPPER_DIR",workdir="$WORK_DIR" "$MERGED_DIR"
 fi
 
 # Создание каталога для старого корня при рокировке корней
@@ -451,13 +458,13 @@ echo "Размонтирование дисков хоста..."
 umount -l "$MERGED_DIR" 2>/dev/null || true
 umount -l "$BASE_DIR"   2>/dev/null || true
 
-rmdir "$BASE_DIR" "$MERGED_DIR"
+rmdir "$MERGED_DIR" "$BASE_DIR"
 
 # Подсчет количества запущенных контейнеров, использующих ROOT_DIR
-active_containers=$(findmnt -t overlay -O "lowerdir=$ROOT_DIR" -n | wc -l)
+active_containers=$(findmnt -t overlay -O "lowerdir=$LOWER_DIR" -n | wc -l)
 if [ "$active_containers" -eq 0 ]; then
-    umount -l "$ROOT_DIR" 2>/dev/null || true
-    rmdir "$ROOT_DIR"
+    umount -l "$LOWER_DIR" 2>/dev/null || true
+    rmdir "$LOWER_DIR"
 fi
 
 echo "Очистка сетевых ресурсов хоста..."
