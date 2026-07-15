@@ -305,7 +305,8 @@ fi
 
 # Настройка сетевого пространства на хосте
 if [ "$IS_NET_ENABLED" = true ]; then
-    # Определение и экспорт ip-адреса и маски шлюза
+
+    # === ШАГ 1: ИЗВЛЕКАЕМ ДАННЫЕ ИЗ CIDR (СТРОГО В НАЧАЛЕ!) ===
     export BRIDGE_IP="${BRIDGE_CIDR%/*}"
     export BRIDGE_MASK="${BRIDGE_CIDR#*/}"
 
@@ -316,43 +317,58 @@ if [ "$IS_NET_ENABLED" = true ]; then
 
     echo "Настройка сети через виртуальный мост $BRIDGE_NAME..."
     
-    nft delete table ip nsbox_nat 2>/dev/null || true
-
-    if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
-        ip link add "$BRIDGE_NAME" type bridge
-        ip addr add "$BRIDGE_CIDR" dev "$BRIDGE_NAME"
-        ip link set "$BRIDGE_NAME" up
-    fi
-
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null
-    
-    # Инициализация таблицы NAT и базовой цепочки
-    nft add table ip nsbox_nat 2>/dev/null || true
-    nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
-    
-    # Расчет адреса сети для маскарадинга
-    mask_num=$(( 0xFFFFFFFF << (32 - $BRIDGE_MASK) ))
-    
+    # === ШАГ 2: МАТЕМАТИЧЕСКИЙ РАСЧЕТ ПОДСЕТИ (ТЕПЕРЬ ПРАВИЛЬНО) ===
+    mask_num=$(( 0xFFFFFFFF << (32 - BRIDGE_MASK) ))
     IFS=. read -r i1 i2 i3 i4 <<< "$BRIDGE_IP"
     bridge_num=$(( (i1 << 24) + (i2 << 16) + (i3 << 8) + i4 ))
     
     network_num=$(( bridge_num & mask_num ))
     broadcast_num=$(( network_num | (~mask_num & 0xFFFFFFFF) ))
     
+    # Рассчитываем точный адрес сети для nftables (например, 10.0.0.0)
     net_addr="$(( (network_num >> 24) & 255 )).$(( (network_num >> 16) & 255 )).$(( (network_num >> 8) & 255 )).$(( network_num & 255 ))"
+    # =======================================================================
 
-    # Маскарадинг подсети на основе вычисленного сетевого адреса
-    nft add rule ip nsbox_nat postrouting ip saddr "$net_addr/$BRIDGE_MASK" masquerade 2>/dev/null || true
+    # Инициализация моста и NAT (только при запуске первого контейнера)
+    if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
+        echo "Создание сетевого моста и инициализация таблиц маршрутизации..."
+        ip link add "$BRIDGE_NAME" type bridge
+        ip addr add "$BRIDGE_CIDR" dev "$BRIDGE_NAME"
+        ip link set "$BRIDGE_NAME" up
+        
+        # Включение форвардинга пакетов в ядре хоста
+        sysctl -w net.ipv4.ip_forward=1 > /dev/null
+        
+        # Очистка старой таблицы, если она зависла в памяти
+        nft delete table ip nsbox_nat 2>/dev/null || true
+        
+        # Создание новой таблицы
+        nft add table ip nsbox_nat 2>/dev/null || true
+        
+        # Добавление базовой цепочки prerouting для активации conntrack (вход ответов из интернета)
+        nft add chain ip nsbox_nat prerouting { type nat hook prerouting priority -100 \; } 2>/dev/null || true
+        
+        # Добавление базовой цепочки postrouting (выход пакетов в интернет)
+        nft add chain ip nsbox_nat postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+        
+        # Добавление правила маскарадинга для всей подсети
+        nft add rule ip nsbox_nat postrouting ip saddr "$net_addr/$BRIDGE_MASK" masquerade 2>/dev/null || true
+    fi
 
-    # Автовыбор IP-адреса для контейнера, если GUEST_IP равен 'auto'
+    # Автобыбр IP-адреса для контейнера
     if [ "$GUEST_IP" = "auto" ]; then
-        # Определение первого и последнего доступного ip-хоста в подсети
         start_num=$(( network_num + 1 ))
         end_num=$(( broadcast_num - 1 ))
 
-        # Сбор занятых ipv4-адресов подсети
-        busy_ips=$( { ip addr show master "$BRIDGE_NAME"; ip neighbor show dev "$BRIDGE_NAME"; } 2>/dev/null | grep -oE "${BRIDGE_IP%.*}\.[0-9]+" | tr '\n' ' ' )
-        busy_ips="$busy_ips $BRIDGE_IP"
+        # Сбор занятых ipv4-адресов через рабочие пространства имен
+        busy_ips="$BRIDGE_IP"
+        for ns in $(ip netns list | awk '{print $1}'); do
+            ns_ip=$(ip netns exec "$ns" ip -4 addr show scope global | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+            if [ -n "$ns_ip" ]; then
+                busy_ips="$busy_ips $ns_ip"
+            fi
+        done
+        busy_ips=$(echo $busy_ips | tr '\n' ' ')
 
         # Перебор хостов внутри диапазона подсети
         GUEST_IP=""
@@ -366,7 +382,7 @@ if [ "$IS_NET_ENABLED" = true ]; then
         done
 
         if [ -z "$GUEST_IP" ]; then
-            echo "Ошибка: Не удалось выделить IP-адрес, в подсети $BRIDGE_CIDR не осталось свободных адресов!"
+            echo "Ошибка: Не удалось выделить IP-адрес!"
             exit 1
         fi
     fi
@@ -460,13 +476,6 @@ umount -l "$BASE_DIR"   2>/dev/null || true
 
 rmdir "$MERGED_DIR" "$BASE_DIR"
 
-# Подсчет количества запущенных контейнеров, использующих ROOT_DIR
-active_containers=$(findmnt -t overlay -O "lowerdir=$LOWER_DIR" -n | wc -l)
-if [ "$active_containers" -eq 0 ]; then
-    umount -l "$LOWER_DIR" 2>/dev/null || true
-    rmdir "$LOWER_DIR"
-fi
-
 echo "Очистка сетевых ресурсов хоста..."
 if [ -n "$VETH_HOST" ] && [ -d "/sys/class/net/$VETH_HOST" ]; then
     ip link set dev "$VETH_HOST" down 2>/dev/null || true
@@ -479,6 +488,25 @@ if [ -e "$NET_NS_FILE" ]; then
     umount -l "$NET_NS_FILE" 2>/dev/null || true
     # Удаление пространство из системы
     ip netns delete "$NET_NAME" 2>/dev/null || true
+fi
+
+active_containers=$(findmnt -t overlay -O "lowerdir=$LOWER_DIR" -n | wc -l)
+
+if [ "$active_containers" -eq 0 ]; then
+    echo "Все контейнеры остановлены. Полная зачистка общей инфраструктуры..."
+
+    # Отключаем и удаляем общий нижний слой монтирования хоста
+    umount -l "$LOWER_DIR" 2>/dev/null || true
+    rmdir "$LOWER_DIR" 2>/dev/null || true
+    
+    # Гасим и удаляем общий виртуальный сетевой мост
+    if [ -d "/sys/class/net/$BRIDGE_NAME" ]; then
+        ip link set dev "$BRIDGE_NAME" down 2>/dev/null || true
+        ip link delete "$BRIDGE_NAME" 2>/dev/null || true
+    fi
+    
+    # Полностью удаляем общую таблицу маскарадинга NAT из nftables
+    nft delete table ip nsbox_nat 2>/dev/null || true
 fi
 
 # Удаление созданной cgroups, если была создана
