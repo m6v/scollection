@@ -8,14 +8,14 @@ set -a
 usage() {
 cat << EOF
 Использование: $(basename "$0") [ОПЦИИ] имя_контейнера
-Запускает программу, имя которой задано в -c, в изолированном контейнере.
-Если именя программы не задано, в контейнере запускается оболочка bash.
+Запускает программу, имя которой задано в аргументе параметра --command, в изолированном контейнере.
+Если имя программы не задано, в контейнере запускается оболочка bash.
 
 Аргументы, обязательные для длинных параметров, обязательны и для коротких.
   -c, --command 'программа'     Запустить программу в изолированном контейнере
-  -g, --gui                     Настроить запуск графических программ внутри контейнера
+  -g, --gui                     Настроить запуск графических программ
   -r, --root 'путь'             Указать корневой каталог ФС контейнера, по умолчанию корень ФС хоста
-  -n, --net 'auto | IP-адрес'   Использовать виртуальный адаптер, например, -n 10.0.0.5
+  -n, --net 'IP-адрес | auto'   Создать в контейнере виртуальный адаптер с указанным или автоматически присвоенным IP-адресом
   -p, --port 'хост:контейнер'   Настроить трансляцию портов, например, -p 8080:80
   -v, --volume 'хост:контейнер' Пробросить папку хоста внутрь контейнера
   -m, --memory 'лимит'          Задать лимит оперативной памяти, например, -m 1G или -m 256M
@@ -29,9 +29,6 @@ exit 1
 if [ "$EUID" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
-
-# Получение ключа авторизации X11 из параметров запущенного графического сервера хоста
-REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' | head -n 1 | cut -d' ' -f2)
 
 # Максимальный размер виртуального диска
 MAX_SIZE="16G"
@@ -55,8 +52,14 @@ HOST_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
 IS_NET_ENABLED=false
 IS_GUI_ENABLED=false
 
-# Путь к cgroup контейнера
-CGROUP_PATH="/sys/fs/cgroup/nsbox"
+
+# Общий системный хаб cgroup
+CGROUP_BASE="/sys/fs/cgroup/nsbox"
+mkdir -p "$CGROUP_BASE"
+
+# Включение контроллеров (память и процессор) для дочерних групп,
+# обязательный шаг в cgroups v2, иначе лимиты внутри подпапок работать не будут
+echo "+cpu +memory" > "$CGROUP_BASE/cgroup.subtree_control" 2>/dev/null || true
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -201,6 +204,9 @@ if [ -z "$CONTAINER_NAME" ]; then
     usage
 fi
 
+# Индивидуальный cgroup-путь CONTAINER_NAME
+CGROUP_PATH="$CGROUP_BASE/$CONTAINER_NAME"
+
 NET_NAME="$CONTAINER_NAME"
 NET_NS_FILE="/var/run/netns/$NET_NAME"
 
@@ -283,11 +289,10 @@ awk -F: '$3 < 1000 || $3 == 65534' /etc/group > "$UPPER_DIR/etc/group"
 chmod 644 "$UPPER_DIR/etc/passwd" "$UPPER_DIR/etc/group"
 
 # Настройка cgroup, если задан хотя бы один из лимитов (память или процессор)
+# Нужно проверять работоспособность! В таком виде не тестировалось!
 if [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
     echo "Настройка контроля ресурсов cgroups v2..."
     mkdir -p "$CGROUP_PATH"
-    echo $$ > "$CGROUP_PATH/cgroup.procs"
-
     # Применение лимита оперативной памяти, если указан
     if [ -n "$MEM_LIMIT" ]; then
         echo "Лимит оперативной памяти зафиксирован: $MEM_LIMIT"
@@ -301,12 +306,13 @@ if [ -n "$MEM_LIMIT" ] || [ -n "$CPU_LIMIT" ]; then
         CPU_QUOTA=$(awk "BEGIN {print int($CPU_LIMIT * 100000)}")
         echo "$CPU_QUOTA 100000" > "$CGROUP_PATH/cpu.max"
     fi
+    echo $$ > "$CGROUP_PATH/cgroup.procs"
 fi
 
 # Настройка сетевого пространства на хосте
 if [ "$IS_NET_ENABLED" = true ]; then
 
-    # === ШАГ 1: ИЗВЛЕКАЕМ ДАННЫЕ ИЗ CIDR (СТРОГО В НАЧАЛЕ!) ===
+    # Извлечение IP-адреса и маски моста из CIDR
     export BRIDGE_IP="${BRIDGE_CIDR%/*}"
     export BRIDGE_MASK="${BRIDGE_CIDR#*/}"
 
@@ -317,7 +323,7 @@ if [ "$IS_NET_ENABLED" = true ]; then
 
     echo "Настройка сети через виртуальный мост $BRIDGE_NAME..."
     
-    # === ШАГ 2: МАТЕМАТИЧЕСКИЙ РАСЧЕТ ПОДСЕТИ (ТЕПЕРЬ ПРАВИЛЬНО) ===
+    # Расчет числовых значений IP-адреса и маски моста
     mask_num=$(( 0xFFFFFFFF << (32 - BRIDGE_MASK) ))
     IFS=. read -r i1 i2 i3 i4 <<< "$BRIDGE_IP"
     bridge_num=$(( (i1 << 24) + (i2 << 16) + (i3 << 8) + i4 ))
@@ -325,9 +331,8 @@ if [ "$IS_NET_ENABLED" = true ]; then
     network_num=$(( bridge_num & mask_num ))
     broadcast_num=$(( network_num | (~mask_num & 0xFFFFFFFF) ))
     
-    # Рассчитываем точный адрес сети для nftables (например, 10.0.0.0)
+    # Рассчет адреса сети для nftables (например, 10.0.0.0)
     net_addr="$(( (network_num >> 24) & 255 )).$(( (network_num >> 16) & 255 )).$(( (network_num >> 8) & 255 )).$(( network_num & 255 ))"
-    # =======================================================================
 
     # Инициализация моста и NAT (только при запуске первого контейнера)
     if ! ip link show "$BRIDGE_NAME" >/dev/null 2>&1; then
@@ -435,9 +440,9 @@ fi
 
 # Настройка графического окружения
 if [ "$IS_GUI_ENABLED" = true ]; then
-    echo "Подготовка безопасной инфраструктуры X11..."
+    echo "Подготовка инфраструктуры X11..."
+    
     mkdir -p "$MERGED_DIR/tmp/.X11-unix"
-
     if [ -d "$XDG_RUNTIME_DIR" ]; then
         # Создание целевой папки внутри оверлея контейнера
         mkdir -p "$MERGED_DIR$XDG_RUNTIME_DIR"
@@ -445,7 +450,9 @@ if [ "$IS_GUI_ENABLED" = true ]; then
         mount --bind "$XDG_RUNTIME_DIR" "$MERGED_DIR$XDG_RUNTIME_DIR"
     fi
     
-    if [ -n "$REAL_XAUTH" ] && [ -f "$REAL_XAUTH" ]; then
+    # Получение ключа авторизации X11 из параметров запущенного графического сервера хоста
+    REAL_XAUTH=$(ps aux | grep -E 'Xorg|X' | grep -v grep | grep -oE '\-auth [^ ]+' | head -n 1 | cut -d' ' -f2)
+    if [ -f "$REAL_XAUTH" ]; then
         # Извлечение 32-символьного hex-ключа (MIT-MAGIC-COOKIE) текущего дисплея хоста
         export XBOX_HEX_COOKIE=$(xauth -f "$REAL_XAUTH" list "$DISPLAY" 2>/dev/null | awk '{print $NF}')
     fi
@@ -495,21 +502,21 @@ active_containers=$(findmnt -t overlay -O "lowerdir=$LOWER_DIR" -n | wc -l)
 if [ "$active_containers" -eq 0 ]; then
     echo "Все контейнеры остановлены. Полная зачистка общей инфраструктуры..."
 
-    # Отключаем и удаляем общий нижний слой монтирования хоста
+    # Откление и удаление общего нижнего слоя монтирования хоста
     umount -l "$LOWER_DIR" 2>/dev/null || true
     rmdir "$LOWER_DIR" 2>/dev/null || true
     
-    # Гасим и удаляем общий виртуальный сетевой мост
+    # Остановка и удаление общего виртуального сетевого моста
     if [ -d "/sys/class/net/$BRIDGE_NAME" ]; then
         ip link set dev "$BRIDGE_NAME" down 2>/dev/null || true
         ip link delete "$BRIDGE_NAME" 2>/dev/null || true
     fi
     
-    # Полностью удаляем общую таблицу маскарадинга NAT из nftables
+    # Удаленине общей таблицы маскарадинга NAT из nftables
     nft delete table ip nsbox_nat 2>/dev/null || true
 fi
 
-# Удаление созданной cgroups, если была создана
+# Удаление cgroups контейнера, если была создана
 if [ -d "$CGROUP_PATH" ]; then
     echo "Удаление контрольной группы cgroups контейнера..."
     rmdir "$CGROUP_PATH" 2>/dev/null || true
